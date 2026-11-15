@@ -28,6 +28,8 @@ header{background:var(--navy);color:#fff;padding:20px var(--pad) 14px;
 header h1{font-size:22px;font-weight:700;letter-spacing:.2px}
 header p{font-size:13px;color:#c8d2dc;margin-top:2px}
 .count{font-size:12px;color:#c8d2dc;margin-top:6px}
+.offline-status{font-size:12px;color:#c8d2dc;margin-top:4px}
+.offline-status.ready{color:#8fce9b}
 /* ---- Search ---- */
 .search-wrap{padding:12px var(--pad) 4px;position:sticky;top:0;z-index:19;
   background:var(--bg)}
@@ -119,6 +121,7 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
     <h1>Al-Ghuse Tailor</h1>
     <p>Designs Collection</p>
     <div class="count" id="count"></div>
+    <div class="offline-status" id="offlineStatus">Checking offline status…</div>
   </header>
 
   <div class="search-wrap">
@@ -538,6 +541,66 @@ if("serviceWorker" in navigator){
     navigator.serviceWorker.register("sw.js").catch(()=>{ /* offline still works from cache on next visit */ });
   });
 }
+
+/* ---- Offline readiness indicator ----
+   The service worker caches the 41 full files (videos first) in the
+   background. This line shows the progress and turns into
+   "Offline ready" once every file is cached, so it is safe to go
+   offline. The page also asks the worker to (re)start the fill on
+   every load, so an interrupted fill always resumes. */
+const SW_CACHE = "alghuse-v7"; // keep in sync with sw.js CACHE
+const FULL_FILES = DESIGNS.map(d=>d.file);
+const offlineStatusEl = document.getElementById("offlineStatus");
+let offlineReady = false;
+function setOfflineStatus(done, total){
+  if(!offlineStatusEl) return;
+  if(done < 0){ offlineStatusEl.style.display = "none"; return; }
+  offlineStatusEl.style.display = "block";
+  if(done >= total){
+    offlineStatusEl.textContent = "Offline ready ✓ — videos play offline";
+    offlineStatusEl.classList.add("ready");
+    offlineReady = true;
+  }else{
+    offlineStatusEl.textContent = "Preparing offline… " + done + "/" + total;
+    offlineStatusEl.classList.remove("ready");
+  }
+}
+async function checkOfflineCache(){
+  if(!("caches" in window)){ setOfflineStatus(-1, 0); return -1; }
+  try{
+    const c = await caches.open(SW_CACHE);
+    let n = 0;
+    for(const f of FULL_FILES){ if(await c.match(f, {ignoreSearch:true})) n++; }
+    setOfflineStatus(n, FULL_FILES.length);
+    return n;
+  }catch(e){ setOfflineStatus(-1, 0); return -1; }
+}
+function triggerFill(){
+  try{
+    const ctrl = navigator.serviceWorker.controller;
+    if(ctrl){ ctrl.postMessage({type:"FILL_MEDIA"}); return; }
+    navigator.serviceWorker.ready.then(reg=>{
+      const sw = (reg && reg.active) || navigator.serviceWorker.controller;
+      if(sw) sw.postMessage({type:"FILL_MEDIA"});
+    }).catch(()=>{});
+  }catch(e){}
+}
+if("serviceWorker" in navigator && "caches" in window){
+  navigator.serviceWorker.addEventListener("message", e=>{
+    const d = e.data || {};
+    if(d.type === "FILL_PROGRESS" || d.type === "FILL_DONE"){
+      setOfflineStatus(d.done, d.total);
+    }
+  });
+  navigator.serviceWorker.addEventListener("controllerchange", ()=>{ triggerFill(); checkOfflineCache(); });
+  triggerFill();
+  checkOfflineCache();
+  const offlineTimer = setInterval(async ()=>{
+    if(offlineReady){ clearInterval(offlineTimer); return; }
+    triggerFill(); // re-ask every 2s: an interrupted fill resumes instead of stalling
+    await checkOfflineCache();
+  }, 2000);
+}else if(offlineStatusEl){ offlineStatusEl.style.display = "none"; }
 
 render();
 </script>

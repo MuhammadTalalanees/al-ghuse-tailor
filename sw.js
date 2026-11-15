@@ -1,11 +1,15 @@
-/* Al-Ghuse Tailor — offline-first service worker (v6).
+/* Al-Ghuse Tailor — offline-first service worker (v7).
    First visit caches only the small critical set (app shell + grid
    thumbnails + video posters, ~2 MB) so the app opens fast even on a
    slow connection. Full-size photos and videos then fill the cache in
-   the background, one file at a time — one failure never blocks the
-   rest — and any file is also cached on demand when first fetched
-   (200 responses only). */
-const CACHE = 'alghuse-v6';
+   the background — VIDEOS FIRST, one file at a time, with retries —
+   and the page shows the progress ("Preparing offline… X/41") until
+   every file is cached ("Offline ready"). The fill is resumable: the
+   page asks the worker to (re)start it on every load, so an
+   interrupted fill (tab closed, worker stopped, network drop) always
+   picks up where it left off instead of silently never finishing.
+   Any file is also cached on demand when first fetched (200 only). */
+const CACHE = 'alghuse-v7';
 const CRITICAL = [
   "index.html",
   "manifest.json",
@@ -53,7 +57,19 @@ const CRITICAL = [
   "media/video-olive-purple-trim-kurta-poster.jpg",
   "media/video-white-kurta-poster.jpg"
 ];
-const FULL_MEDIA = [
+/* Videos first: they are the biggest files and the ones users most
+   often find missing offline, so they get cached before the photos. */
+const VIDEOS = [
+  "media/29-blue-shirt-collar-kurta.mp4",
+  "media/30-light-grey-mesh-collar-kurta.mp4",
+  "media/31-light-blue-shirt.mp4",
+  "media/video-black-kurta.mp4",
+  "media/video-folded-kurtas.mp4",
+  "media/video-grey-mesh-kurta.mp4",
+  "media/video-olive-purple-trim-kurta.mp4",
+  "media/video-white-kurta.mp4"
+];
+const PHOTOS = [
   "media/01-grey-band-collar-kurta.jpg",
   "media/02-black-contrast-kurta.jpg",
   "media/03-brown-taupe-kurta.jpg",
@@ -86,30 +102,69 @@ const FULL_MEDIA = [
   "media/33-dark-green-kurta.jpg",
   "media/34-dark-grey-stitch-kurta.jpg",
   "media/35-white-band-collar-kurta.jpg",
-  "media/36-white-brown-collar-kurta.jpg",
-  "media/29-blue-shirt-collar-kurta.mp4",
-  "media/30-light-grey-mesh-collar-kurta.mp4",
-  "media/31-light-blue-shirt.mp4",
-  "media/video-black-kurta.mp4",
-  "media/video-folded-kurtas.mp4",
-  "media/video-grey-mesh-kurta.mp4",
-  "media/video-olive-purple-trim-kurta.mp4",
-  "media/video-white-kurta.mp4"
+  "media/36-white-brown-collar-kurta.jpg"
 ];
+const FULL_MEDIA = [...VIDEOS, ...PHOTOS];
 
-/* Background fill: cache every full-size file, tolerating failures
-   per file. Fire-and-forget — install/activate never wait on it. */
-function fillFullMedia(){
-  caches.open(CACHE).then((c) => {
-    FULL_MEDIA.forEach((u) => {
-      c.match(u, { ignoreSearch: true }).then((hit) => {
-        if(hit) return;
-        fetch(u).then((res) => {
-          if(res && res.status === 200) c.put(u, res);
-        }).catch(() => {});
-      });
-    });
-  }).catch(() => {});
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+async function broadcast(msg){
+  try{
+    const clients = await self.clients.matchAll({includeUncontrolled: true});
+    clients.forEach(c => { try{ c.postMessage(msg); }catch(e){} });
+  }catch(e){}
+}
+
+async function countCached(cache){
+  let n = 0;
+  for(const u of FULL_MEDIA){
+    try{ if(await cache.match(u, {ignoreSearch: true})) n++; }catch(e){}
+  }
+  return n;
+}
+
+/* Background fill: cache every full-size file, videos first, one at a
+   time with up to 3 tries per file. Sequential on purpose — 41
+   concurrent fetches contend for one slow connection and the browser
+   queues/drops them; one-at-a-time gives steady, reportable progress.
+   Skips files already cached, so re-running the fill resumes exactly
+   where a previous run stopped. Never throws. */
+let filling = false;
+async function fillFullMedia(){
+  if(filling) return;
+  filling = true;
+  try{
+    const cache = await caches.open(CACHE);
+    let done = await countCached(cache);
+    await broadcast({type: 'FILL_PROGRESS', done, total: FULL_MEDIA.length});
+    if(done >= FULL_MEDIA.length){
+      await broadcast({type: 'FILL_DONE', done, total: FULL_MEDIA.length});
+      return;
+    }
+    for(const u of FULL_MEDIA){
+      let hit = null;
+      try{ hit = await cache.match(u, {ignoreSearch: true}); }catch(e){}
+      if(hit) continue;
+      let ok = false;
+      for(let attempt = 0; attempt < 3 && !ok; attempt++){
+        try{
+          const res = await fetch(u);
+          if(res && res.status === 200){ await cache.put(u, res); ok = true; }
+          else if(attempt < 2) await sleep(1000);
+        }catch(e){ if(attempt < 2) await sleep(1000); }
+      }
+      if(ok){
+        done++;
+        await broadcast({type: 'FILL_PROGRESS', done, total: FULL_MEDIA.length});
+      }
+    }
+    done = await countCached(cache);
+    await broadcast({type: done >= FULL_MEDIA.length ? 'FILL_DONE' : 'FILL_PROGRESS', done, total: FULL_MEDIA.length});
+  }catch(e){
+    /* Never fatal: the page re-triggers the fill on its next load. */
+  }finally{
+    filling = false;
+  }
 }
 
 self.addEventListener('install', (e) => {
@@ -127,6 +182,21 @@ self.addEventListener('activate', (e) => {
       .then(() => self.clients.claim())
   );
   fillFullMedia();
+});
+
+/* The page asks for a (re)fill on every load, so an interrupted fill
+   always resumes. FILL_STATUS lets the page ask how far along it is. */
+self.addEventListener('message', (e) => {
+  const t = e.data && (e.data.type || e.data);
+  if(t === 'FILL_MEDIA'){
+    fillFullMedia();
+  }else if(t === 'FILL_STATUS'){
+    caches.open(CACHE).then(async (cache) => {
+      const done = await countCached(cache);
+      const msg = {type: done >= FULL_MEDIA.length ? 'FILL_DONE' : 'FILL_PROGRESS', done, total: FULL_MEDIA.length};
+      if(e.source){ try{ e.source.postMessage(msg); }catch(err){} }
+    }).catch(()=>{});
+  }
 });
 
 self.addEventListener('fetch', (e) => {
