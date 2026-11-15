@@ -187,13 +187,318 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
 
 <script>
 /* =====================================================================
-   FIREBASE — PLACEHOLDER ONLY (v1 uses on-device storage)
+   FIREBASE SYNC (Firestore + Anonymous Auth)
    ---------------------------------------------------------------------
-   Firebase sync comes later. When Talal provides his Firebase project,
-   paste the config object here and set FIREBASE_CONFIG. Until then the
-   app NEVER contacts Firebase or any server — everything works offline.
-   --------------------------------------------------------------------- */
-const FIREBASE_CONFIG = null; // e.g. { apiKey:"…", authDomain:"…", projectId:"…" }
+   The app works fully offline on-device (localStorage + IndexedDB).
+   Firebase adds cross-phone sync on top: renames, deletes and added
+   designs are mirrored to Cloud Firestore, so a change on one phone
+   appears on every phone that opens the same link.
+   - Auth: Anonymous (signInAnonymously, persisted). The Firestore
+     rules allow only authenticated access, so nothing syncs until
+     sign-in succeeds.
+   - Collections: overrides {name}, deleted {deletedAt},
+     added {name, type, createdAt, imageData?, posterData?,
+     videoLocalOnly?}.
+   - Firebase Storage is NOT enabled on this project (Spark plan needs
+     Blaze/billing for Storage), so added media syncs WITHOUT Storage:
+     photos as a downscaled JPEG data URL inside the doc, videos as a
+     poster thumbnail only (the video file stays on the phone it was
+     added from). See uploadAddedMedia() — that ONE function is where
+     a real Storage upload slots in later.
+   - If Firebase cannot be reached (offline / blocked), every write
+     is queued locally and flushed when the connection returns, and
+     the app keeps working from local state exactly as before.
+   ===================================================================== */
+const FIREBASE_CONFIG = { apiKey:"AIzaSyCbT8irlz7BuQAEFWdbSJL9bYEoYCIh6xI", authDomain:"al-ghuse-tailor.firebaseapp.com", projectId:"al-ghuse-tailor", storageBucket:"al-ghuse-tailor.firebasestorage.app", messagingSenderId:"884157794234", appId:"1:884157794234:web:d9041c781172350f603f83" };
+const FB_SDK = "https://www.gstatic.com/firebasejs/10.12.2/";
+
+/* Remote (Firestore) state — merged over local state at render time.
+   Firestore wins for renames; deletes are a union (a delete is a
+   delete — there is no un-delete in the app). */
+let fb = null;            // {app, auth, db, doc, collection, setDoc, deleteDoc, onSnapshot, serverTimestamp, signInAnonymously}
+let fbReady = false;      // true once anonymous sign-in succeeded
+let fbInitStarted = false;
+let fbApp = null;
+let listenersAttached = false;
+let listenerRetryTimer = null;
+let fbOverrides = {};     // design id -> name
+let fbDeleted = new Set();// design ids deleted on any phone
+let fbAdded = {};         // design id -> {name, type, imageData, posterData, videoLocalOnly}
+let syncedAdded = loadSyncedAdded(); // local added ids whose doc reached Firestore
+let flushing = false;
+
+const LS_PENDING = "alghuse_pending_ops";   // [{kind,id,name?,type?}] — Firestore writes waiting for a connection
+const LS_SYNCED_ADDED = "alghuse_synced_added"; // [id] — added designs already stored in Firestore
+
+/* ---- Pending ops (offline write queue) ---- */
+function loadPending(){
+  try{
+    const raw = JSON.parse(localStorage.getItem(LS_PENDING)||"[]");
+    if(!Array.isArray(raw)) return [];
+    return raw.filter(o=>o && typeof o.kind==="string" && typeof o.id==="string");
+  }catch(e){ return []; }
+}
+function savePending(p){ try{ localStorage.setItem(LS_PENDING, JSON.stringify(p)); }catch(e){} }
+function slimOp(op){
+  const o = {kind:op.kind, id:op.id};
+  if(op.name!==undefined) o.name = op.name;
+  if(op.type!==undefined) o.type = op.type;
+  return o;
+}
+function queueOp(op){
+  const ops = loadPending().filter(o=>!(o.kind===op.kind && o.id===op.id));
+  ops.push(slimOp(op));
+  savePending(ops);
+}
+function dropPendingOp(kind, id){
+  savePending(loadPending().filter(o=>!(o.kind===kind && o.id===id)));
+}
+function loadSyncedAdded(){
+  try{
+    const raw = JSON.parse(localStorage.getItem(LS_SYNCED_ADDED)||"[]");
+    return new Set(Array.isArray(raw) ? raw.filter(x=>typeof x==="string") : []);
+  }catch(e){ return new Set(); }
+}
+function saveSyncedAdded(){ try{ localStorage.setItem(LS_SYNCED_ADDED, JSON.stringify([...syncedAdded])); }catch(e){} }
+
+/* ---- Added-media sync payload (Storage-ready slot) ---- */
+function loadImageFromBlob(blob){
+  return new Promise((res, rej)=>{
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = ()=>{ URL.revokeObjectURL(url); res(img); };
+    img.onerror = ()=>{ URL.revokeObjectURL(url); rej(new Error("image load failed")); };
+    img.src = url;
+  });
+}
+async function downscaleImageToDataUrl(blob, maxDim, quality){
+  const img = await loadImageFromBlob(blob);
+  const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.max(1, Math.round(img.naturalWidth * scale));
+  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  c.getContext("2d").drawImage(img, 0, 0, w, h);
+  return c.toDataURL("image/jpeg", quality);
+}
+async function imageSyncDataUrl(blob){
+  /* Firestore documents must stay under 1 MiB: try progressively
+     smaller encodings until the data URL is safely below the limit. */
+  const tries = [[800, 0.75], [640, 0.70], [480, 0.65]];
+  for(const [dim, q] of tries){
+    try{
+      const url = await downscaleImageToDataUrl(blob, dim, q);
+      if(url && url.length <= 700000) return url;
+    }catch(e){ return null; }
+  }
+  return null;
+}
+function captureVideoPoster(blob){
+  return new Promise((res)=>{
+    const url = URL.createObjectURL(blob);
+    const v = document.createElement("video");
+    v.muted = true; v.playsInline = true; v.preload = "auto";
+    let done = false;
+    const finish = (out)=>{ if(done) return; done = true; clearTimeout(timer); URL.revokeObjectURL(url); res(out); };
+    const timer = setTimeout(()=>finish(null), 10000);
+    v.onloadedmetadata = ()=>{ try{ v.currentTime = Math.max(0, Math.min(0.5, (v.duration||1) * 0.25)); }catch(e){ finish(null); } };
+    v.onseeked = ()=>{
+      try{
+        const scale = Math.min(1, 480 / Math.max(v.videoWidth||1, v.videoHeight||1));
+        const w = Math.max(1, Math.round(v.videoWidth * scale));
+        const h = Math.max(1, Math.round(v.videoHeight * scale));
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        c.getContext("2d").drawImage(v, 0, 0, w, h);
+        finish(c.toDataURL("image/jpeg", 0.75));
+      }catch(e){ finish(null); }
+    };
+    v.onerror = ()=>finish(null);
+    v.src = url;
+  });
+}
+/* TODO (Storage): when the Blaze plan is enabled, upload the original
+   file here with uploadBytes(ref(storage, "added/" + id + "/" +
+   file.name)) and return {storagePath, downloadUrl} (plus a small
+   thumb for images). Callers spread this function's return value
+   into the Firestore doc, so no other code needs to change. Until
+   then: photos sync as a downscaled data URL, videos sync their
+   poster only and stay local-only (videoLocalOnly). */
+async function uploadAddedMedia(id, file, type){
+  if(type === "image"){
+    const imageData = await imageSyncDataUrl(file);
+    return imageData ? {imageData} : {};
+  }
+  const posterData = await captureVideoPoster(file);
+  const out = {videoLocalOnly: true};
+  if(posterData) out.posterData = posterData;
+  return out;
+}
+
+/* ---- Firestore writes (local-first: try now, queue on failure) ---- */
+async function applyOp(op){
+  const F = fb;
+  if(!F) throw new Error("firebase not ready");
+  if(op.kind === "rename"){
+    await F.setDoc(F.doc(F.db, "overrides", op.id), {name: op.name}, {merge: true});
+  }else if(op.kind === "delete"){
+    await F.setDoc(F.doc(F.db, "deleted", op.id), {deletedAt: F.serverTimestamp()});
+  }else if(op.kind === "deleteOverride"){
+    await F.deleteDoc(F.doc(F.db, "overrides", op.id));
+  }else if(op.kind === "deleteAdded"){
+    await F.deleteDoc(F.doc(F.db, "added", op.id));
+  }else if(op.kind === "add"){
+    let payload = {};
+    if(op.imageData || op.posterData){
+      payload = {imageData: op.imageData, posterData: op.posterData, videoLocalOnly: op.videoLocalOnly};
+    }else{
+      const blob = await dbGet(op.id).catch(()=>null);
+      if(!blob) return; // local copy gone — nothing left to sync
+      try{ payload = await uploadAddedMedia(op.id, blob, op.type); }
+      catch(e){ payload = {}; }
+      if(op.type === "image" && !payload.imageData) return; // too big to sync — stays local-only
+    }
+    const docData = {name: op.name, type: op.type, createdAt: F.serverTimestamp()};
+    if(payload.imageData) docData.imageData = payload.imageData;
+    if(payload.posterData) docData.posterData = payload.posterData;
+    if(op.type === "video") docData.videoLocalOnly = true;
+    await F.setDoc(F.doc(F.db, "added", op.id), docData);
+    syncedAdded.add(op.id); saveSyncedAdded();
+  }
+}
+async function fbWriteOrQueue(op){
+  try{
+    if(fbReady){ await applyOp(op); return; }
+  }catch(e){ /* fall through to queue */ }
+  queueOp(op);
+}
+async function flushPending(){
+  if(!fbReady || flushing) return;
+  flushing = true;
+  try{
+    let ops = loadPending();
+    while(ops.length){
+      const op = ops[0];
+      try{ await applyOp(op); }
+      catch(e){ break; } // transient failure — retry on next online/load
+      ops = loadPending().filter(o=>!(o.kind===op.kind && o.id===op.id));
+      savePending(ops);
+    }
+  }finally{ flushing = false; }
+}
+function syncRename(id, name){ fbWriteOrQueue({kind:"rename", id, name}); }
+function syncDelete(id){ fbWriteOrQueue({kind:"delete", id}); }
+function syncDeleteOverride(id){ fbWriteOrQueue({kind:"deleteOverride", id}); }
+function syncDeleteAdded(id){
+  dropPendingOp("add", id);
+  syncedAdded.delete(id); saveSyncedAdded();
+  fbWriteOrQueue({kind:"deleteAdded", id});
+}
+async function syncAddDesign(id, name, type, file){
+  let payload = {};
+  try{ payload = await uploadAddedMedia(id, file, type); }catch(e){ payload = {}; }
+  if(type === "image" && !payload.imageData){ queueOp({kind:"add", id, name, type}); return; }
+  await fbWriteOrQueue({kind:"add", id, name, type, ...payload});
+}
+
+/* ---- Firestore listeners (attach after anonymous sign-in) ---- */
+function scheduleListenerRetry(){
+  if(listenerRetryTimer) return;
+  listenerRetryTimer = setTimeout(()=>{ listenerRetryTimer = null; listenersAttached = false; if(fbReady) attachListeners(); }, 30000);
+}
+function attachListeners(){
+  if(listenersAttached || !fbReady) return;
+  listenersAttached = true;
+  const F = fb;
+  const onErr = ()=>{ listenersAttached = false; scheduleListenerRetry(); };
+  F.onSnapshot(F.collection(F.db, "overrides"), (snap)=>{
+    const m = {};
+    snap.forEach(d=>{ const v = d.data(); if(v && typeof v.name === "string") m[d.id] = v.name; });
+    fbOverrides = m;
+    render();
+  }, onErr);
+  F.onSnapshot(F.collection(F.db, "deleted"), (snap)=>{
+    const known = new Set(DESIGNS.map(d=>d.id));
+    const s = new Set();
+    snap.forEach(d=>{ if(known.has(d.id)) s.add(d.id); });
+    fbDeleted = s;
+    render();
+  }, onErr);
+  F.onSnapshot(F.collection(F.db, "added"), (snap)=>{
+    const m = {};
+    snap.forEach(d=>{
+      const v = d.data();
+      if(!v) return;
+      m[d.id] = {
+        name: (typeof v.name === "string" ? v.name : "Untitled Design"),
+        type: (v.type === "video" ? "video" : "image"),
+        imageData: (typeof v.imageData === "string" ? v.imageData : null),
+        posterData: (typeof v.posterData === "string" ? v.posterData : null),
+        videoLocalOnly: !!v.videoLocalOnly
+      };
+    });
+    fbAdded = m;
+    if(!snap.metadata.fromCache){
+      /* Server state: a synced added design missing here was deleted
+         on another phone — remove its local copy too. (Only from a
+         server snapshot: a cache-only snapshot may legitimately lag.) */
+      let changed = false;
+      for(const id of [...syncedAdded]){
+        if(!fbAdded[id]){
+          syncedAdded.delete(id); changed = true;
+          addedMeta = addedMeta.filter(a=>a.id!==id);
+          if(addedUrls[id]){ URL.revokeObjectURL(addedUrls[id]); delete addedUrls[id]; }
+          dbDelete(id).catch(()=>{});
+        }
+      }
+      if(changed){ saveSyncedAdded(); saveAddedMeta(addedMeta); }
+    }
+    render();
+  }, onErr);
+}
+
+/* ---- Firebase init: load SDK on demand, sign in anonymously ----
+   The SDK comes from Google's CDN. If it cannot load (offline, or
+   the first visit happens with no connection), the app simply runs
+   local-only and retries when the browser comes back online. */
+async function initFirebase(){
+  if(!FIREBASE_CONFIG || fbInitStarted) return;
+  fbInitStarted = true;
+  try{
+    const [appMod, authMod, fsMod] = await Promise.all([
+      import(FB_SDK + "firebase-app.js"),
+      import(FB_SDK + "firebase-auth.js"),
+      import(FB_SDK + "firebase-firestore.js")
+    ]);
+    if(!fbApp){
+      try{ fbApp = appMod.initializeApp(FIREBASE_CONFIG); }
+      catch(e){ fbApp = appMod.getApp(); } // already initialized (retry after a partial failure)
+    }
+    const auth = authMod.getAuth(fbApp);
+    let db;
+    try{
+      db = fsMod.initializeFirestore(fbApp, {localCache: fsMod.persistentLocalCache({})});
+    }catch(e){
+      db = fsMod.getFirestore(fbApp); // persistent cache unavailable — in-memory cache instead
+    }
+    fb = {app: fbApp, auth, db,
+      doc: fsMod.doc, collection: fsMod.collection, setDoc: fsMod.setDoc, deleteDoc: fsMod.deleteDoc,
+      onSnapshot: fsMod.onSnapshot, serverTimestamp: fsMod.serverTimestamp,
+      signInAnonymously: authMod.signInAnonymously};
+    authMod.onAuthStateChanged(auth, (user)=>{
+      if(user){ fbReady = true; attachListeners(); flushPending(); }
+      else{ tryAuth(); }
+    });
+  }catch(e){
+    fb = null; fbReady = false; fbInitStarted = false; // allow retry on next 'online'
+  }
+}
+async function tryAuth(){
+  if(!fb || fbReady) return;
+  try{ await fb.signInAnonymously(fb.auth); }
+  catch(e){ /* offline — retried on 'online' */ }
+}
+window.addEventListener("online", ()=>{ initFirebase(); tryAuth(); attachListeners(); flushPending(); });
 // =====================================================================
 
 /* Built-in designs (bundled media — all files live in media/) */
@@ -319,10 +624,13 @@ let addedMeta = loadAddedMeta();
 let addedUrls = {}; // id -> object URL
 let current = null; // design shown in detail view
 
-function displayName(d){ return overrides[d.id] || d.name; }
+/* Firestore wins for renames; deletes are a union of local + remote. */
+function displayName(d){ return fbOverrides[d.id] || overrides[d.id] || d.name; }
+function isDeleted(id){ return deletedIds.has(id) || fbDeleted.has(id); }
 
 async function allDesigns(){
-  const list = DESIGNS.filter(d=>!deletedIds.has(d.id)).map(d=>({...d, name:displayName(d)}));
+  const list = DESIGNS.filter(d=>!isDeleted(d.id)).map(d=>({...d, name:displayName(d)}));
+  const listed = new Set();
   const stale = [];
   for(const a of addedMeta){
     if(!addedUrls[a.id]){
@@ -332,11 +640,26 @@ async function allDesigns(){
       else if(dbOk) stale.push(a.id); // metadata saved but media gone — drop the stale entry
       // if IndexedDB itself failed, keep the metadata and just skip it this render
     }
-    if(addedUrls[a.id]) list.push({id:a.id, name:displayName(a), file:addedUrls[a.id], type:a.type, added:true});
+    if(addedUrls[a.id]){ listed.add(a.id); list.push({id:a.id, name:displayName(a), file:addedUrls[a.id], type:a.type, added:true}); }
   }
   if(stale.length){
+    /* A stale local entry whose synced copy still exists in Firestore
+       is listed below from the remote copy instead. */
     addedMeta = addedMeta.filter(a=>!stale.includes(a.id));
     saveAddedMeta(addedMeta);
+  }
+  /* Added designs from other phones (Firestore). Local copies — same
+     id, with the full-quality blob — are already listed above. */
+  for(const id of Object.keys(fbAdded)){
+    if(listed.has(id)) continue;
+    const r = fbAdded[id];
+    if(!r || (r.type!=="image" && r.type!=="video")) continue;
+    if(r.type==="image"){
+      if(!r.imageData) continue; // photo not synced yet (still uploading on the other phone)
+      list.push({id, name:displayName({id, name:r.name}), file:r.imageData, type:"image", added:true, remote:true});
+    }else{
+      list.push({id, name:displayName({id, name:r.name}), file:null, poster:r.posterData||null, type:"video", added:true, remote:true, videoRemote:true});
+    }
   }
   return list;
 }
@@ -373,13 +696,16 @@ async function render(){
     card.className = "card";
     card.setAttribute("role","button");
     card.setAttribute("tabindex","0");
-    const media = d.type==="video"
-      ? (d.poster
-          ? '<img src="'+d.poster+'" alt="'+escapeHtml(d.name)+'" loading="lazy">'
-          : '<video src="'+d.file+'" muted playsinline preload="metadata"></video>')
-        + '<span class="video-badge">&#9654; Video</span>'
-      : '<img src="'+thumbFor(d)+'" data-full="'+d.file+'" alt="'+escapeHtml(d.name)+'" loading="lazy" onerror="this.onerror=null;this.src=this.dataset.full;">';
-    const note = d.note ? "<small>"+escapeHtml(d.note)+"</small>" : "";
+    let media;
+    if(d.type==="video"){
+      if(d.poster) media = '<img src="'+d.poster+'" alt="'+escapeHtml(d.name)+'" loading="lazy">';
+      else if(d.file) media = '<video src="'+d.file+'" muted playsinline preload="metadata"></video>';
+      else media = '<div style="display:flex;align-items:center;justify-content:center;height:100%;min-height:180px;background:#1f2937;color:#fff;font-size:42px;">&#9654;</div>';
+      media += '<span class="video-badge">&#9654; Video</span>';
+    }else{
+      media = '<img src="'+thumbFor(d)+'" data-full="'+d.file+'" alt="'+escapeHtml(d.name)+'" loading="lazy" onerror="this.onerror=null;this.src=this.dataset.full;">';
+    }
+    const note = d.videoRemote ? "<small>Phone-only video</small>" : (d.note ? "<small>"+escapeHtml(d.note)+"</small>" : "");
     card.innerHTML = '<div class="thumb">'+media+'</div><div class="card-name">'+escapeHtml(d.name)+note+'</div>';
     card.addEventListener("click", ()=>openDetail(d));
     card.addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openDetail(d); } });
@@ -410,13 +736,23 @@ const nameInput = document.getElementById("nameInput");
 function openDetail(d){
   current = d;
   detailName.textContent = displayName(d);
-  detailTag.textContent = d.type==="video" ? "Video — tap play to watch" : (d.added ? "Added on this phone" : "Photo");
+  if(d.type==="video"){
+    detailTag.textContent = d.videoRemote ? "Video — plays only on the phone it was added from" : "Video — tap play to watch";
+  }else{
+    detailTag.textContent = d.remote ? "Photo — shared from another phone" : (d.added ? "Added on this phone" : "Photo");
+  }
   nameEdit.style.display = "none";
   deleteConfirm.style.display = "none";
   deleteBtn.style.display = "block";
-  detailMedia.innerHTML = d.type==="video"
-    ? '<video src="'+d.file+'" controls autoplay playsinline></video>'
-    : '<img src="'+d.file+'" alt="'+escapeHtml(displayName(d))+'">';
+  if(d.type==="video" && !d.file){
+    detailMedia.innerHTML = d.poster
+      ? '<img src="'+d.poster+'" alt="'+escapeHtml(displayName(d))+'">'
+      : '<div class="empty">Video preview not available on this phone.</div>';
+  }else{
+    detailMedia.innerHTML = d.type==="video"
+      ? '<video src="'+d.file+'" controls autoplay playsinline></video>'
+      : '<img src="'+d.file+'" alt="'+escapeHtml(displayName(d))+'">';
+  }
   detail.classList.add("open");
   document.body.style.overflow = "hidden";
 }
@@ -436,7 +772,7 @@ document.getElementById("editNameBtn").addEventListener("click", ()=>{
 document.getElementById("saveNameBtn").addEventListener("click", ()=>{
   if(!current) return;
   const v = nameInput.value.trim();
-  if(v){ overrides[current.id] = v; saveOverrides(overrides); }
+  if(v){ overrides[current.id] = v; saveOverrides(overrides); syncRename(current.id, v); }
   detailName.textContent = displayName(current);
   nameEdit.style.display = "none";
   render();
@@ -463,12 +799,15 @@ document.getElementById("confirmDelete").addEventListener("click", async ()=>{
     saveAddedMeta(addedMeta);
     if(addedUrls[id]){ URL.revokeObjectURL(addedUrls[id]); delete addedUrls[id]; }
     try{ await dbDelete(id); }catch(e){ /* blob already gone */ }
+    syncDeleteAdded(id);
   }else{
     deletedIds.add(id);
     saveDeleted(deletedIds);
+    syncDelete(id);
   }
   delete overrides[id];
   saveOverrides(overrides);
+  syncDeleteOverride(id);
   closeDetail();
   await render();
   showToast("Design deleted");
@@ -521,6 +860,7 @@ document.getElementById("saveAdd").addEventListener("click", async ()=>{
   }
   addedMeta.push({id:id, name:name, type:type});
   saveAddedMeta(addedMeta);
+  syncAddDesign(id, name, type, pickedFile);
   closeSheet();
   await render();
   showToast("Design saved");
@@ -548,7 +888,7 @@ if("serviceWorker" in navigator){
    "Offline ready" once every file is cached, so it is safe to go
    offline. The page also asks the worker to (re)start the fill on
    every load, so an interrupted fill always resumes. */
-const SW_CACHE = "alghuse-v7"; // keep in sync with sw.js CACHE
+const SW_CACHE = "alghuse-v8"; // keep in sync with sw.js CACHE
 const FULL_FILES = DESIGNS.map(d=>d.file);
 const offlineStatusEl = document.getElementById("offlineStatus");
 let offlineReady = false;
@@ -603,6 +943,7 @@ if("serviceWorker" in navigator && "caches" in window){
 }else if(offlineStatusEl){ offlineStatusEl.style.display = "none"; }
 
 render();
+initFirebase(); // starts anonymous sign-in + Firestore sync in the background (local-first if it fails)
 </script>
 </body>
 </html>
