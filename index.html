@@ -123,7 +123,7 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
     <p>Designs Collection</p>
     <div class="count" id="count"></div>
     <div class="offline-status" id="offlineStatus">Checking offline status…</div>
-    <div class="sync-status" id="syncStatus">v9 • Sync: Connecting…</div>
+    <div class="sync-status" id="syncStatus">v10 • Sync: Connecting…</div>
   </header>
 
   <div class="search-wrap">
@@ -210,6 +210,12 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
    - If Firebase cannot be reached (offline / blocked), every write
      is queued locally and flushed when the connection returns, and
      the app keeps working from local state exactly as before.
+   - v10: silent write failures fixed — a payload that cannot be
+     built THROWS (the op stays queued instead of being dropped), an
+     image load that hangs times out, queued writes retry every 30s,
+     local changes that never synced are re-queued on load
+     (reconcile), and the status line shows pending count + last
+     sync error so a failure is never invisible again.
    ===================================================================== */
 const FIREBASE_CONFIG = { apiKey:"AIzaSyCbT8irlz7BuQAEFWdbSJL9bYEoYCIh6xI", authDomain:"al-ghuse-tailor.firebaseapp.com", projectId:"al-ghuse-tailor", storageBucket:"al-ghuse-tailor.firebasestorage.app", messagingSenderId:"884157794234", appId:"1:884157794234:web:d9041c781172350f603f83" };
 const FB_SDK = "https://www.gstatic.com/firebasejs/10.12.2/";
@@ -228,6 +234,7 @@ let fbDeleted = new Set();// design ids deleted on any phone
 let fbAdded = {};         // design id -> {name, type, imageData, posterData, videoLocalOnly}
 let syncedAdded = loadSyncedAdded(); // local added ids whose doc reached Firestore
 let flushing = false;
+let fbSnapshotsLoaded = {overrides:false, deleted:false, added:false}; // set by each onSnapshot's first fire
 
 const LS_PENDING = "alghuse_pending_ops";   // [{kind,id,name?,type?}] — Firestore writes waiting for a connection
 const LS_SYNCED_ADDED = "alghuse_synced_added"; // [id] — added designs already stored in Firestore
@@ -251,9 +258,11 @@ function queueOp(op){
   const ops = loadPending().filter(o=>!(o.kind===op.kind && o.id===op.id));
   ops.push(slimOp(op));
   savePending(ops);
+  updateSyncStatus();
 }
 function dropPendingOp(kind, id){
   savePending(loadPending().filter(o=>!(o.kind===kind && o.id===id)));
+  updateSyncStatus();
 }
 function loadSyncedAdded(){
   try{
@@ -265,11 +274,21 @@ function saveSyncedAdded(){ try{ localStorage.setItem(LS_SYNCED_ADDED, JSON.stri
 
 /* ---- Added-media sync payload (Storage-ready slot) ---- */
 function loadImageFromBlob(blob){
+  /* A hung image load used to await forever: the add op was never
+     queued and never written, with no error anywhere. 15s is plenty
+     for a local blob; after that the caller treats it as a failure
+     and the op stays queued for retry instead. */
   return new Promise((res, rej)=>{
     const url = URL.createObjectURL(blob);
     const img = new Image();
-    img.onload = ()=>{ URL.revokeObjectURL(url); res(img); };
-    img.onerror = ()=>{ URL.revokeObjectURL(url); rej(new Error("image load failed")); };
+    let done = false;
+    const timer = setTimeout(()=>{
+      if(done) return; done = true;
+      URL.revokeObjectURL(url);
+      rej(new Error("image load timed out"));
+    }, 15000);
+    img.onload = ()=>{ if(done) return; done = true; clearTimeout(timer); URL.revokeObjectURL(url); res(img); };
+    img.onerror = ()=>{ if(done) return; done = true; clearTimeout(timer); URL.revokeObjectURL(url); rej(new Error("image load failed")); };
     img.src = url;
   });
 }
@@ -291,7 +310,7 @@ async function imageSyncDataUrl(blob){
     try{
       const url = await downscaleImageToDataUrl(blob, dim, q);
       if(url && url.length <= 700000) return url;
-    }catch(e){ return null; }
+    }catch(e){ /* try the next smaller encoding instead of giving up */ }
   }
   return null;
 }
@@ -355,10 +374,14 @@ async function applyOp(op){
       payload = {imageData: op.imageData, posterData: op.posterData, videoLocalOnly: op.videoLocalOnly};
     }else{
       const blob = await dbGet(op.id).catch(()=>null);
-      if(!blob) return; // local copy gone — nothing left to sync
+      /* A payload that cannot be built THROWS now: the op stays
+         queued for retry instead of being silently dropped (the old
+         code returned here, so flushPending deleted the op as if it
+         had succeeded and the design never synced). */
+      if(!blob) throw new Error("local media missing");
       try{ payload = await uploadAddedMedia(op.id, blob, op.type); }
-      catch(e){ payload = {}; }
-      if(op.type === "image" && !payload.imageData) return; // too big to sync — stays local-only
+      catch(e){ throw new Error("media prepare failed: " + shortErr(e)); }
+      if(op.type === "image" && !payload.imageData) throw new Error("photo too large to sync");
     }
     const docData = {name: op.name, type: op.type, createdAt: F.serverTimestamp()};
     if(payload.imageData) docData.imageData = payload.imageData;
@@ -370,22 +393,29 @@ async function applyOp(op){
 }
 async function fbWriteOrQueue(op){
   try{
-    if(fbReady){ await applyOp(op); return; }
-  }catch(e){ /* fall through to queue */ }
+    if(fbReady){ await applyOp(op); clearSyncError(); return; }
+  }catch(e){ setSyncError(e); /* fall through to queue */ }
   queueOp(op);
 }
 async function flushPending(){
   if(!fbReady || flushing) return;
   flushing = true;
   try{
-    let ops = loadPending();
-    while(ops.length){
-      const op = ops[0];
-      try{ await applyOp(op); }
-      catch(e){ break; } // transient failure — retry on next online/load
-      ops = loadPending().filter(o=>!(o.kind===op.kind && o.id===op.id));
-      savePending(ops);
+    /* One pass over a snapshot: a stuck op stays queued for retry
+       but never blocks the ops behind it. */
+    const ops = loadPending();
+    let failed = false;
+    for(const op of ops){
+      try{
+        await applyOp(op);
+        dropPendingOp(op.kind, op.id);
+      }catch(e){
+        failed = true;
+        setSyncError(e); // op stays in the queue — retried by the periodic flush
+      }
     }
+    if(!failed && !loadPending().length) clearSyncError();
+    updateSyncStatus();
   }finally{ flushing = false; }
 }
 function syncRename(id, name){ fbWriteOrQueue({kind:"rename", id, name}); }
@@ -397,10 +427,19 @@ function syncDeleteAdded(id){
   fbWriteOrQueue({kind:"deleteAdded", id});
 }
 async function syncAddDesign(id, name, type, file){
-  let payload = {};
-  try{ payload = await uploadAddedMedia(id, file, type); }catch(e){ payload = {}; }
-  if(type === "image" && !payload.imageData){ queueOp({kind:"add", id, name, type}); return; }
-  await fbWriteOrQueue({kind:"add", id, name, type, ...payload});
+  /* Every failure path ends with the op queued — an add can never
+     vanish silently (a hung image load, a failed downscale, a
+     Firestore error). The periodic flush + reconcile retry it. */
+  try{
+    let payload = {};
+    try{ payload = await uploadAddedMedia(id, file, type); }catch(e){ payload = {}; }
+    if(type === "image" && !payload.imageData){ queueOp({kind:"add", id, name, type}); updateSyncStatus(); return; }
+    await fbWriteOrQueue({kind:"add", id, name, type, ...payload});
+  }catch(e){
+    queueOp({kind:"add", id, name, type});
+    setSyncError(e);
+  }
+  updateSyncStatus();
 }
 
 /* ---- Firestore listeners (attach after anonymous sign-in) ---- */
@@ -417,6 +456,8 @@ function attachListeners(){
     const m = {};
     snap.forEach(d=>{ const v = d.data(); if(v && typeof v.name === "string") m[d.id] = v.name; });
     fbOverrides = m;
+    fbSnapshotsLoaded.overrides = true;
+    reconcileLocalWithServer();
     render();
   }, onErr);
   F.onSnapshot(F.collection(F.db, "deleted"), (snap)=>{
@@ -424,6 +465,8 @@ function attachListeners(){
     const s = new Set();
     snap.forEach(d=>{ if(known.has(d.id)) s.add(d.id); });
     fbDeleted = s;
+    fbSnapshotsLoaded.deleted = true;
+    reconcileLocalWithServer();
     render();
   }, onErr);
   F.onSnapshot(F.collection(F.db, "added"), (snap)=>{
@@ -440,6 +483,8 @@ function attachListeners(){
       };
     });
     fbAdded = m;
+    fbSnapshotsLoaded.added = true;
+    reconcileLocalWithServer();
     if(!snap.metadata.fromCache){
       /* Server state: a synced added design missing here was deleted
          on another phone — remove its local copy too. (Only from a
@@ -459,6 +504,41 @@ function attachListeners(){
   }, onErr);
 }
 
+/* ---- Self-heal: reconcile local state with Firestore ----
+   Runs after each snapshot arrives. Anything saved on this phone
+   that never reached Firestore (a write that failed silently on an
+   older version, or an op queued while offline) is queued again —
+   the earlier "testing cat" / "checking" adds sync by themselves
+   on the next load, with no need to re-add them. This pass only
+   ever QUEUES local changes; it never deletes or overwrites
+   server state. */
+function reconcileLocalWithServer(){
+  if(!fbReady) return;
+  const queued = loadPending();
+  const isQueued = (kind, id)=>queued.some(o=>o.kind===kind && o.id===id);
+  if(fbSnapshotsLoaded.added){
+    for(const a of addedMeta){
+      if(syncedAdded.has(a.id)) continue;
+      if(fbAdded[a.id]){ syncedAdded.add(a.id); saveSyncedAdded(); continue; } // already on the server
+      if(!isQueued("add", a.id)) queueOp({kind:"add", id:a.id, name:a.name, type:a.type});
+    }
+  }
+  if(fbSnapshotsLoaded.overrides){
+    for(const id of Object.keys(overrides)){
+      if(fbOverrides[id] === overrides[id]) continue; // server already has this rename
+      if(!isQueued("rename", id)) queueOp({kind:"rename", id, name:overrides[id]});
+    }
+  }
+  if(fbSnapshotsLoaded.deleted){
+    for(const id of deletedIds){
+      if(fbDeleted.has(id)) continue; // server already has this delete
+      if(!isQueued("delete", id)) queueOp({kind:"delete", id});
+    }
+  }
+  updateSyncStatus();
+  flushPending();
+}
+
 /* ---- Firebase init: load SDK on demand, sign in anonymously ----
    The SDK comes from Google's CDN. If it cannot load (offline, or
    the first visit happens with no connection), the app simply runs
@@ -466,12 +546,28 @@ function attachListeners(){
 /* ---- App version + live sync status line (header) ----
    Shows which version is actually running on this phone, so a stale
    cached page can never be mistaken for the latest one. */
-const APP_VERSION = "v9";
+const APP_VERSION = "v10";
 const syncStatusEl = document.getElementById("syncStatus");
-function setSyncStatus(state){
-  if(!syncStatusEl) return;
-  syncStatusEl.textContent = APP_VERSION + " • Sync: " + state;
+let syncBaseState = "Connecting…"; // Connected | Local only | Connecting…
+let lastSyncError = "";            // short message of the last failed write ("" = none)
+function shortErr(e){
+  const m = String((e && e.message) || e || "sync failed").replace(/^FirebaseError:\s*/, "").trim();
+  return m.slice(0, 48);
 }
+function updateSyncStatus(){
+  if(!syncStatusEl) return;
+  let s = lastSyncError ? "Error — " + lastSyncError : syncBaseState;
+  const n = loadPending().length;
+  if(n > 0) s += " • " + n + " pending";
+  syncStatusEl.textContent = APP_VERSION + " • Sync: " + s;
+}
+function setSyncStatus(state){
+  syncBaseState = state;
+  if(state === "Connected") lastSyncError = "";
+  updateSyncStatus();
+}
+function setSyncError(e){ lastSyncError = shortErr(e); updateSyncStatus(); }
+function clearSyncError(){ if(lastSyncError){ lastSyncError = ""; updateSyncStatus(); } }
 async function initFirebase(){
   if(!FIREBASE_CONFIG || fbInitStarted) return;
   fbInitStarted = true;
@@ -900,7 +996,7 @@ if("serviceWorker" in navigator){
    "Offline ready" once every file is cached, so it is safe to go
    offline. The page also asks the worker to (re)start the fill on
    every load, so an interrupted fill always resumes. */
-const SW_CACHE = "alghuse-v9"; // keep in sync with sw.js CACHE
+const SW_CACHE = "alghuse-v10"; // keep in sync with sw.js CACHE
 const FULL_FILES = DESIGNS.map(d=>d.file);
 const offlineStatusEl = document.getElementById("offlineStatus");
 let offlineReady = false;
@@ -956,6 +1052,16 @@ if("serviceWorker" in navigator && "caches" in window){
 
 render();
 initFirebase(); // starts anonymous sign-in + Firestore sync in the background (local-first if it fails)
+/* Retry queued writes every 30s while connected — a write that fails
+   once (flaky network, a slow image prepare) is retried on its own
+   instead of waiting for the next reload or 'online' event. */
+let flushTimerStarted = false;
+function startFlushTimer(){
+  if(flushTimerStarted) return;
+  flushTimerStarted = true;
+  setInterval(()=>{ if(fbReady) flushPending(); updateSyncStatus(); }, 30000);
+}
+startFlushTimer();
 </script>
 </body>
 </html>
