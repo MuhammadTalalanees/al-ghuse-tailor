@@ -30,6 +30,7 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
 .count{font-size:12px;color:#c8d2dc;margin-top:6px}
 .offline-status{font-size:12px;color:#c8d2dc;margin-top:4px}
 .offline-status.ready{color:#8fce9b}
+.sync-status{font-size:11px;color:#8a97a3;margin-top:4px}
 /* ---- Search ---- */
 .search-wrap{padding:12px var(--pad) 4px;position:sticky;top:0;z-index:19;
   background:var(--bg)}
@@ -122,6 +123,7 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
     <p>Designs Collection</p>
     <div class="count" id="count"></div>
     <div class="offline-status" id="offlineStatus">Checking offline status…</div>
+    <div class="sync-status" id="syncStatus">v9 • Sync: Connecting…</div>
   </header>
 
   <div class="search-wrap">
@@ -461,6 +463,15 @@ function attachListeners(){
    The SDK comes from Google's CDN. If it cannot load (offline, or
    the first visit happens with no connection), the app simply runs
    local-only and retries when the browser comes back online. */
+/* ---- App version + live sync status line (header) ----
+   Shows which version is actually running on this phone, so a stale
+   cached page can never be mistaken for the latest one. */
+const APP_VERSION = "v9";
+const syncStatusEl = document.getElementById("syncStatus");
+function setSyncStatus(state){
+  if(!syncStatusEl) return;
+  syncStatusEl.textContent = APP_VERSION + " • Sync: " + state;
+}
 async function initFirebase(){
   if(!FIREBASE_CONFIG || fbInitStarted) return;
   fbInitStarted = true;
@@ -486,19 +497,20 @@ async function initFirebase(){
       onSnapshot: fsMod.onSnapshot, serverTimestamp: fsMod.serverTimestamp,
       signInAnonymously: authMod.signInAnonymously};
     authMod.onAuthStateChanged(auth, (user)=>{
-      if(user){ fbReady = true; attachListeners(); flushPending(); }
+      if(user){ fbReady = true; setSyncStatus("Connected"); attachListeners(); flushPending(); }
       else{ tryAuth(); }
     });
   }catch(e){
     fb = null; fbReady = false; fbInitStarted = false; // allow retry on next 'online'
+    setSyncStatus("Local only"); // SDK could not load — running from local state only
   }
 }
 async function tryAuth(){
   if(!fb || fbReady) return;
   try{ await fb.signInAnonymously(fb.auth); }
-  catch(e){ /* offline — retried on 'online' */ }
+  catch(e){ setSyncStatus("Local only"); /* offline — retried on 'online' */ }
 }
-window.addEventListener("online", ()=>{ initFirebase(); tryAuth(); attachListeners(); flushPending(); });
+window.addEventListener("online", ()=>{ if(!fbReady) setSyncStatus("Connecting…"); initFirebase(); tryAuth(); attachListeners(); flushPending(); });
 // =====================================================================
 
 /* Built-in designs (bundled media — all files live in media/) */
@@ -888,7 +900,7 @@ if("serviceWorker" in navigator){
    "Offline ready" once every file is cached, so it is safe to go
    offline. The page also asks the worker to (re)start the fill on
    every load, so an interrupted fill always resumes. */
-const SW_CACHE = "alghuse-v8"; // keep in sync with sw.js CACHE
+const SW_CACHE = "alghuse-v9"; // keep in sync with sw.js CACHE
 const FULL_FILES = DESIGNS.map(d=>d.file);
 const offlineStatusEl = document.getElementById("offlineStatus");
 let offlineReady = false;

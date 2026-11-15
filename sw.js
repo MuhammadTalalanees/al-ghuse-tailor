@@ -12,7 +12,7 @@
    interrupted fill (tab closed, worker stopped, network drop) always
    picks up where it left off instead of silently never finishing.
    Any file is also cached on demand when first fetched (200 only). */
-const CACHE = 'alghuse-v8';
+const CACHE = 'alghuse-v9';
 const CRITICAL = [
   "index.html",
   "manifest.json",
