@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#16283a">
+<title>Al-Ghuse Tailor — Designs</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+/* ---- Design tokens ---- */
+:root{
+  --navy:#16283a; --gold:#b98a2f; --gold-dark:#9a7425;
+  --bg:#faf9f7; --card:#ffffff; --ink:#1c1c1c; --muted:#6b7280;
+  --line:#e8e4de; --radius:14px; --pad:16px;
+  --shadow:0 1px 3px rgba(22,40,58,.10),0 4px 14px rgba(22,40,58,.06);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:var(--bg);color:var(--ink);line-height:1.5}
+.app{max-width:480px;margin:0 auto;min-height:100vh;background:var(--bg);
+  padding-bottom:96px}
+/* ---- Header ---- */
+header{background:var(--navy);color:#fff;padding:20px var(--pad) 14px;
+  position:sticky;top:0;z-index:20}
+header h1{font-size:22px;font-weight:700;letter-spacing:.2px}
+header p{font-size:13px;color:#c8d2dc;margin-top:2px}
+.count{font-size:12px;color:#c8d2dc;margin-top:6px}
+/* ---- Search ---- */
+.search-wrap{padding:12px var(--pad) 4px;position:sticky;top:0;z-index:19;
+  background:var(--bg)}
+.search-box{display:flex;align-items:center;gap:8px;background:#fff;
+  border:1px solid var(--line);border-radius:12px;padding:0 12px;
+  box-shadow:var(--shadow)}
+.search-box svg{flex:0 0 auto;opacity:.55}
+.search-box input{flex:1;border:0;outline:0;font-size:16px;padding:12px 0;
+  background:transparent;color:var(--ink);min-width:0}
+.search-box input::placeholder{color:#9aa0a6}
+.clear-btn{border:0;background:transparent;font-size:20px;line-height:1;
+  color:var(--muted);cursor:pointer;padding:6px;display:none}
+/* ---- Grid ---- */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px var(--pad) 0}
+.card{background:var(--card);border-radius:var(--radius);overflow:hidden;
+  box-shadow:var(--shadow);cursor:pointer;border:1px solid var(--line);
+  display:flex;flex-direction:column}
+.card:active{transform:scale(.98)}
+.thumb{position:relative;aspect-ratio:3/4;background:#fff;overflow:hidden}
+.thumb img,.thumb video{width:100%;height:100%;object-fit:cover;display:block}
+.video-badge{position:absolute;left:8px;bottom:8px;background:rgba(22,40,58,.85);
+  color:#fff;font-size:11px;font-weight:600;padding:3px 8px;border-radius:20px}
+.card-name{padding:10px 10px 12px;font-size:13.5px;font-weight:600;line-height:1.35}
+.card-name small{display:block;font-weight:500;color:var(--muted);font-size:11.5px;margin-top:2px}
+.empty{grid-column:1/-1;text-align:center;color:var(--muted);padding:40px 16px;
+  font-size:15px}
+/* ---- FAB ---- */
+.fab{position:fixed;right:18px;bottom:22px;width:58px;height:58px;border-radius:50%;
+  background:var(--gold);color:#fff;border:0;font-size:32px;line-height:1;
+  box-shadow:0 4px 16px rgba(185,138,47,.5);cursor:pointer;z-index:30;
+  display:flex;align-items:center;justify-content:center}
+.fab:active{background:var(--gold-dark)}
+/* ---- Detail view ---- */
+.detail{position:fixed;inset:0;background:#fff;z-index:50;display:none;
+  flex-direction:column}
+.detail.open{display:flex}
+.detail-bar{display:flex;align-items:center;gap:12px;padding:12px 14px;
+  border-bottom:1px solid var(--line);background:#fff}
+.detail-bar h2{flex:1;font-size:16px;font-weight:700;line-height:1.3;min-width:0}
+.icon-btn{border:1px solid var(--line);background:#fff;border-radius:10px;
+  width:40px;height:40px;font-size:18px;cursor:pointer;flex:0 0 auto;
+  display:flex;align-items:center;justify-content:center;color:var(--ink)}
+.detail-media{flex:1;min-height:0;background:#fff;display:flex;align-items:center;
+  justify-content:center;overflow:hidden}
+.detail-media img{max-width:100%;max-height:100%;object-fit:contain}
+.detail-media video{max-width:100%;max-height:100%;background:#000}
+.detail-foot{padding:12px 16px 20px;border-top:1px solid var(--line);
+  font-size:13px;color:var(--muted)}
+.name-edit{display:flex;gap:8px;margin-top:10px}
+.name-edit input{flex:1;border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px;font-size:15px;outline:0;min-width:0}
+.name-edit button{border:0;border-radius:10px;background:var(--navy);color:#fff;
+  padding:10px 16px;font-size:14px;font-weight:600;cursor:pointer}
+.btn-danger{background:#b42318;color:#fff}
+.btn-danger-outline{background:#fff;border:1px solid #eec5bf;color:#b42318;width:100%;margin-top:12px}
+.delete-confirm{margin-top:12px;border:1px solid #f0d4d0;background:#fdf6f5;
+  border-radius:12px;padding:12px}
+.delete-confirm p{font-size:14px;font-weight:600;color:#7a271a}
+/* ---- Add sheet ---- */
+.sheet-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:60;
+  display:none;align-items:flex-end;justify-content:center}
+.sheet-backdrop.open{display:flex}
+.sheet{background:#fff;border-radius:20px 20px 0 0;width:100%;max-width:480px;
+  padding:20px 18px calc(20px + env(safe-area-inset-bottom));max-height:88vh;
+  overflow-y:auto}
+.sheet h2{font-size:18px;margin-bottom:4px}
+.sheet p.hint{font-size:13px;color:var(--muted);margin-bottom:16px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
+.field input[type=text]{width:100%;border:1px solid var(--line);border-radius:10px;
+  padding:12px;font-size:15px;outline:0}
+.field input[type=file]{width:100%;font-size:14px}
+.preview{margin-top:10px;border-radius:12px;overflow:hidden;display:none}
+.preview img,.preview video{width:100%;max-height:280px;object-fit:contain;
+  background:#f3f1ee;display:block}
+.sheet-actions{display:flex;gap:10px;margin-top:18px}
+.btn{flex:1;border:0;border-radius:12px;padding:13px;font-size:15px;
+  font-weight:600;cursor:pointer}
+.btn-primary{background:var(--navy);color:#fff}
+.btn-ghost{background:#f1efec;border:1px solid var(--line);color:var(--ink)}
+.toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);
+  background:var(--navy);color:#fff;padding:10px 18px;border-radius:24px;
+  font-size:14px;z-index:70;display:none;box-shadow:0 4px 16px rgba(0,0,0,.25)}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Al-Ghuse Tailor</h1>
+    <p>Designs Collection</p>
+    <div class="count" id="count"></div>
+  </header>
+
+  <div class="search-wrap">
+    <div class="search-box">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#16283a" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input id="search" type="search" placeholder="Search designs…" autocomplete="off" aria-label="Search designs">
+      <button class="clear-btn" id="clearSearch" aria-label="Clear search">&times;</button>
+    </div>
+  </div>
+
+  <main class="grid" id="grid"></main>
+</div>
+
+<button class="fab" id="fab" aria-label="Add design">+</button>
+
+<!-- Detail view -->
+<div class="detail" id="detail" role="dialog" aria-label="Design detail">
+  <div class="detail-bar">
+    <button class="icon-btn" id="detailClose" aria-label="Close">&larr;</button>
+    <h2 id="detailName"></h2>
+    <button class="icon-btn" id="editNameBtn" aria-label="Edit name">&#9998;</button>
+  </div>
+  <div class="detail-media" id="detailMedia"></div>
+  <div class="detail-foot">
+    <div id="detailTag"></div>
+    <div class="name-edit" id="nameEdit" style="display:none">
+      <input type="text" id="nameInput" aria-label="Design name">
+      <button id="saveNameBtn">Save</button>
+    </div>
+    <button class="btn btn-danger-outline" id="deleteBtn">Delete Design</button>
+    <div class="delete-confirm" id="deleteConfirm" style="display:none">
+      <p>Delete this design?</p>
+      <div class="sheet-actions" style="margin-top:10px">
+        <button class="btn btn-ghost" id="cancelDelete">Cancel</button>
+        <button class="btn btn-danger" id="confirmDelete">Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Add design sheet -->
+<div class="sheet-backdrop" id="sheetBackdrop">
+  <div class="sheet" role="dialog" aria-label="Add design">
+    <h2>Add Design</h2>
+    <p class="hint">Pick a photo or video from your phone, give it a name, and save it. It stays on this phone and works offline.</p>
+    <div class="field">
+      <label for="fileInput">Photo / Video</label>
+      <input type="file" id="fileInput" accept="image/*,video/*">
+      <div class="preview" id="preview"></div>
+    </div>
+    <div class="field">
+      <label for="designName">Design name</label>
+      <input type="text" id="designName" placeholder="e.g. Grey Band-Collar Kurta" autocomplete="off">
+    </div>
+    <div class="sheet-actions">
+      <button class="btn btn-ghost" id="cancelAdd">Cancel</button>
+      <button class="btn btn-primary" id="saveAdd">Save Design</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* =====================================================================
+   FIREBASE — PLACEHOLDER ONLY (v1 uses on-device storage)
+   ---------------------------------------------------------------------
+   Firebase sync comes later. When Talal provides his Firebase project,
+   paste the config object here and set FIREBASE_CONFIG. Until then the
+   app NEVER contacts Firebase or any server — everything works offline.
+   --------------------------------------------------------------------- */
+const FIREBASE_CONFIG = null; // e.g. { apiKey:"…", authDomain:"…", projectId:"…" }
+// =====================================================================
+
+/* Built-in designs (bundled media — all files live in media/) */
+const DESIGNS = [
+  {id:"d01", name:"Grey Band-Collar Kurta", file:"media/01-grey-band-collar-kurta.jpg", type:"image"},
+  {id:"d02", name:"Black Contrast Kurta", file:"media/02-black-contrast-kurta.jpg", type:"image"},
+  {id:"d03", name:"Brown Taupe Kurta", file:"media/03-brown-taupe-kurta.jpg", type:"image"},
+  {id:"d04", name:"Grey Mesh-Stitch Kurta", file:"media/04-grey-mesh-stitch-kurta.jpg", type:"image"},
+  {id:"d05", name:"Navy White-Stitch Kurta", file:"media/05-navy-white-stitch-kurta.jpg", type:"image"},
+  {id:"d06", name:"Cream Embroidered Kurta", file:"media/06-cream-embroidered-kurta.jpg", type:"image"},
+  {id:"d07", name:"Teal Cuff Kurta", file:"media/07-teal-cuff-kurta.jpg", type:"image"},
+  {id:"d08", name:"Brown Collar Kurta", file:"media/08-brown-collar-kurta.jpg", type:"image"},
+  {id:"d09", name:"Black Red-Stitch Kurta", file:"media/09-black-red-stitch-kurta.jpg", type:"image"},
+  {id:"d10", name:"Beige Pattern-Trim Kurta", file:"media/10-beige-pattern-trim-kurta.jpg", type:"image"},
+  {id:"d11", name:"White Chikankari Kurta", file:"media/11-white-chikankari-kurta.jpg", type:"image"},
+  {id:"d12", name:"Black Kurta", file:"media/12-black-kurta.jpg", type:"image"},
+  {id:"d13", name:"Black Gold-Piping Kurta", file:"media/13-black-gold-piping-kurta.jpg", type:"image"},
+  {id:"d14", name:"Light Grey Blended Kurta", file:"media/14-light-grey-blended-kurta.jpg", type:"image"},
+  {id:"d15", name:"Brown Cuff Kurta", file:"media/15-brown-cuff-kurta.jpg", type:"image"},
+  {id:"d16", name:"Brown Collar Kurta — Close-Up", file:"media/16-brown-collar-closeup-kurta.jpg", type:"image"},
+  {id:"d17", name:"Navy Shirt-Style Kurta", file:"media/17-navy-shirt-kurta.jpg", type:"image"},
+  {id:"d18", name:"Light Grey Black-Trim Kurta", file:"media/18-light-grey-black-trim-kurta.jpg", type:"image"},
+  {id:"d19", name:"Dark Purple Kurta", file:"media/19-dark-purple-kurta.jpg", type:"image"},
+  {id:"d20", name:"Black Kurta — Cuff Detail", file:"media/20-black-kurta.jpg", type:"image"},
+  {id:"d21", name:"Maroon Kurta", file:"media/21-maroon-kurta.jpg", type:"image"},
+  {id:"d22", name:"Grey Shirt-Collar Kurta", file:"media/22-grey-shirt-collar-kurta.jpg", type:"image"},
+  {id:"d23", name:"Black Collar Kurta", file:"media/23-black-collar-kurta.jpg", type:"image"},
+  {id:"d24", name:"Black Kurta — On Model", file:"media/24-black-kurta-model.jpg", type:"image"},
+  {id:"d25", name:"Grey Collar Kurta — Close-Up", file:"media/25-grey-collar-closeup-kurta.jpg", type:"image"},
+  {id:"d26", name:"Olive Kurta", file:"media/26-olive-kurta.jpg", type:"image"},
+  {id:"d27", name:"Maroon Kurta — Classic", file:"media/27-maroon-kurta-2.jpg", type:"image"},
+  {id:"d28", name:"White Gold-Button Kurta", file:"media/28-white-gold-button-kurta.jpg", type:"image"},
+  {id:"d29", name:"Blue Shirt-Collar Kurta", file:"media/29-blue-shirt-collar-kurta.mp4", type:"video", poster:"media/29-blue-shirt-collar-kurta-poster.jpg"},
+  {id:"d30", name:"Light Grey Mesh-Collar Kurta", file:"media/30-light-grey-mesh-collar-kurta.mp4", type:"video", poster:"media/30-light-grey-mesh-collar-kurta-poster.jpg"},
+  {id:"d31", name:"Light Blue Shirt", file:"media/31-light-blue-shirt.mp4", type:"video", poster:"media/31-light-blue-shirt-poster.jpg"},
+  {id:"d32", name:"Navy White-Piping Kurta", file:"media/32-navy-white-piping-kurta.jpg", type:"image"},
+  {id:"d33", name:"Dark Green Kurta", file:"media/33-dark-green-kurta.jpg", type:"image"},
+  {id:"d34", name:"Dark Grey Stitch Kurta", file:"media/34-dark-grey-stitch-kurta.jpg", type:"image"},
+  {id:"d35", name:"White Band-Collar Kurta", file:"media/35-white-band-collar-kurta.jpg", type:"image"},
+  {id:"d36", name:"White Brown-Collar Kurta", file:"media/36-white-brown-collar-kurta.jpg", type:"image"},
+  {id:"v01", name:"White Kurta — Video", file:"media/video-white-kurta.mp4", type:"video", poster:"media/video-white-kurta-poster.jpg"},
+  {id:"v02", name:"Grey Mesh Kurta — Video", file:"media/video-grey-mesh-kurta.mp4", type:"video", poster:"media/video-grey-mesh-kurta-poster.jpg"},
+  {id:"v03", name:"Black Kurta — Video", file:"media/video-black-kurta.mp4", type:"video", poster:"media/video-black-kurta-poster.jpg"},
+  {id:"v04", name:"Olive Purple-Trim Kurta — Video", file:"media/video-olive-purple-trim-kurta.mp4", type:"video", poster:"media/video-olive-purple-trim-kurta-poster.jpg"},
+  {id:"v05", name:"Folded Kurtas — Video", file:"media/video-folded-kurtas.mp4", type:"video", poster:"media/video-folded-kurtas-poster.jpg"}
+];
+
+/* ---- Storage ----
+   Names (incl. renames) live in localStorage.
+   Added designs' media blobs live in IndexedDB (on-device, offline) —
+   localStorage cannot hold photos/videos (5 MB limit), so blobs go to
+   IndexedDB while their names/metadata stay in localStorage. */
+const LS_NAMES = "alghuse_name_overrides";
+const LS_ADDED = "alghuse_added_designs"; // metadata only: [{id,name,type}]
+const LS_DELETED = "alghuse_deleted_designs"; // ids of built-in designs the user deleted
+const DB_NAME = "alghuse_tailor";
+const DB_STORE = "media";
+
+function loadOverrides(){
+  try{
+    const raw = JSON.parse(localStorage.getItem(LS_NAMES)||"{}");
+    if(!raw || typeof raw!=="object" || Array.isArray(raw)) return {};
+    const clean = {};
+    for(const k of Object.keys(raw)){ if(typeof raw[k]==="string") clean[k] = raw[k]; }
+    return clean;
+  }catch(e){ return {}; }
+}
+function saveOverrides(o){ localStorage.setItem(LS_NAMES, JSON.stringify(o)); }
+function loadDeleted(){
+  try{
+    const raw = JSON.parse(localStorage.getItem(LS_DELETED)||"[]");
+    if(!Array.isArray(raw)) return new Set();
+    /* Only ids that exist in the built-in catalog may hide a design —
+       stale/unknown ids saved by older versions are dropped, never fatal. */
+    const known = new Set(DESIGNS.map(d=>d.id));
+    return new Set(raw.filter(id=>typeof id==="string" && known.has(id)));
+  }catch(e){ return new Set(); }
+}
+function saveDeleted(s){ localStorage.setItem(LS_DELETED, JSON.stringify([...s])); }
+function loadAddedMeta(){
+  try{
+    const raw = JSON.parse(localStorage.getItem(LS_ADDED)||"[]");
+    if(!Array.isArray(raw)) return [];
+    return raw.filter(a=>a && typeof a.id==="string" && typeof a.name==="string" && (a.type==="image"||a.type==="video"));
+  }catch(e){ return []; }
+}
+function saveAddedMeta(a){ localStorage.setItem(LS_ADDED, JSON.stringify(a)); }
+
+function openDB(){
+  return new Promise((res, rej)=>{
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = ()=>{ req.result.createObjectStore(DB_STORE); };
+    req.onsuccess = ()=>res(req.result);
+    req.onerror = ()=>rej(req.error);
+  });
+}
+function dbPut(id, blob){
+  return openDB().then(db=>new Promise((res, rej)=>{
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).put(blob, id);
+    tx.oncomplete = ()=>res(); tx.onerror = ()=>rej(tx.error);
+  }));
+}
+function dbGet(id){
+  return openDB().then(db=>new Promise((res, rej)=>{
+    const req = db.transaction(DB_STORE, "readonly").objectStore(DB_STORE).get(id);
+    req.onsuccess = ()=>res(req.result||null);
+    req.onerror = ()=>rej(req.error);
+  }));
+}
+function dbDelete(id){
+  return openDB().then(db=>new Promise((res, rej)=>{
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).delete(id);
+    tx.oncomplete = ()=>res(); tx.onerror = ()=>rej(tx.error);
+  }));
+}
+
+/* ---- State ---- */
+const overrides = loadOverrides();
+const deletedIds = loadDeleted();
+let addedMeta = loadAddedMeta();
+let addedUrls = {}; // id -> object URL
+let current = null; // design shown in detail view
+
+function displayName(d){ return overrides[d.id] || d.name; }
+
+async function allDesigns(){
+  const list = DESIGNS.filter(d=>!deletedIds.has(d.id)).map(d=>({...d, name:displayName(d)}));
+  const stale = [];
+  for(const a of addedMeta){
+    if(!addedUrls[a.id]){
+      let blob = null, dbOk = true;
+      try{ blob = await dbGet(a.id); }catch(e){ dbOk = false; }
+      if(blob) addedUrls[a.id] = URL.createObjectURL(blob);
+      else if(dbOk) stale.push(a.id); // metadata saved but media gone — drop the stale entry
+      // if IndexedDB itself failed, keep the metadata and just skip it this render
+    }
+    if(addedUrls[a.id]) list.push({id:a.id, name:displayName(a), file:addedUrls[a.id], type:a.type, added:true});
+  }
+  if(stale.length){
+    addedMeta = addedMeta.filter(a=>!stale.includes(a.id));
+    saveAddedMeta(addedMeta);
+  }
+  return list;
+}
+
+/* Grid thumbnails: built-in photos show a small 440px thumb (the full
+   file loads only in detail view). A failed thumb falls back to the
+   full file, so the grid never shows a broken image. */
+function thumbFor(d){
+  if(d.added || d.type!=="image") return d.file;
+  return "media/thumbs/" + d.file.split("/").pop();
+}
+
+/* ---- Render ---- */
+const grid = document.getElementById("grid");
+const countEl = document.getElementById("count");
+const searchInput = document.getElementById("search");
+const clearBtn = document.getElementById("clearSearch");
+
+let renderSeq = 0;
+async function render(){
+  const seq = ++renderSeq;
+  const q = searchInput.value.trim().toLowerCase();
+  const list = await allDesigns();
+  if(seq !== renderSeq) return; // a newer render (search/delete/add) superseded this one
+  const shown = q ? list.filter(d=>d.name.toLowerCase().includes(q)) : list;
+  countEl.textContent = shown.length + " design" + (shown.length===1?"":"s") + (q ? " matching “" + searchInput.value.trim() + "”" : " · tap a design to view");
+  grid.innerHTML = "";
+  if(!shown.length){
+    grid.innerHTML = '<div class="empty">No designs found for “' + escapeHtml(searchInput.value.trim()) + '”.<br>Try another word.</div>';
+    return;
+  }
+  for(const d of shown){
+    const card = document.createElement("div");
+    card.className = "card";
+    card.setAttribute("role","button");
+    card.setAttribute("tabindex","0");
+    const media = d.type==="video"
+      ? (d.poster
+          ? '<img src="'+d.poster+'" alt="'+escapeHtml(d.name)+'" loading="lazy">'
+          : '<video src="'+d.file+'" muted playsinline preload="metadata"></video>')
+        + '<span class="video-badge">&#9654; Video</span>'
+      : '<img src="'+thumbFor(d)+'" data-full="'+d.file+'" alt="'+escapeHtml(d.name)+'" loading="lazy" onerror="this.onerror=null;this.src=this.dataset.full;">';
+    const note = d.note ? "<small>"+escapeHtml(d.note)+"</small>" : "";
+    card.innerHTML = '<div class="thumb">'+media+'</div><div class="card-name">'+escapeHtml(d.name)+note+'</div>';
+    card.addEventListener("click", ()=>openDetail(d));
+    card.addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openDetail(d); } });
+    grid.appendChild(card);
+  }
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+/* ---- Search (live, as you type) ---- */
+let searchTimer = null;
+searchInput.addEventListener("input", ()=>{
+  clearBtn.style.display = searchInput.value ? "block" : "none";
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(render, 80);
+});
+clearBtn.addEventListener("click", ()=>{
+  searchInput.value = ""; clearBtn.style.display = "none"; render(); searchInput.focus();
+});
+
+/* ---- Detail view ---- */
+const detail = document.getElementById("detail");
+const detailName = document.getElementById("detailName");
+const detailMedia = document.getElementById("detailMedia");
+const detailTag = document.getElementById("detailTag");
+const nameEdit = document.getElementById("nameEdit");
+const nameInput = document.getElementById("nameInput");
+
+function openDetail(d){
+  current = d;
+  detailName.textContent = displayName(d);
+  detailTag.textContent = d.type==="video" ? "Video — tap play to watch" : (d.added ? "Added on this phone" : "Photo");
+  nameEdit.style.display = "none";
+  deleteConfirm.style.display = "none";
+  deleteBtn.style.display = "block";
+  detailMedia.innerHTML = d.type==="video"
+    ? '<video src="'+d.file+'" controls autoplay playsinline></video>'
+    : '<img src="'+d.file+'" alt="'+escapeHtml(displayName(d))+'">';
+  detail.classList.add("open");
+  document.body.style.overflow = "hidden";
+}
+function closeDetail(){
+  detail.classList.remove("open");
+  detailMedia.innerHTML = "";
+  document.body.style.overflow = "";
+  current = null;
+}
+document.getElementById("detailClose").addEventListener("click", closeDetail);
+document.getElementById("editNameBtn").addEventListener("click", ()=>{
+  if(!current) return;
+  nameInput.value = displayName(current);
+  nameEdit.style.display = "flex";
+  nameInput.focus(); nameInput.select();
+});
+document.getElementById("saveNameBtn").addEventListener("click", ()=>{
+  if(!current) return;
+  const v = nameInput.value.trim();
+  if(v){ overrides[current.id] = v; saveOverrides(overrides); }
+  detailName.textContent = displayName(current);
+  nameEdit.style.display = "none";
+  render();
+  showToast("Name updated");
+});
+
+/* ---- Delete design (with confirm; works offline, on-device) ---- */
+const deleteBtn = document.getElementById("deleteBtn");
+const deleteConfirm = document.getElementById("deleteConfirm");
+deleteBtn.addEventListener("click", ()=>{
+  if(!current) return;
+  deleteConfirm.style.display = "block";
+  deleteBtn.style.display = "none";
+});
+document.getElementById("cancelDelete").addEventListener("click", ()=>{
+  deleteConfirm.style.display = "none";
+  deleteBtn.style.display = "block";
+});
+document.getElementById("confirmDelete").addEventListener("click", async ()=>{
+  if(!current) return;
+  const id = current.id;
+  if(current.added){
+    addedMeta = addedMeta.filter(a=>a.id!==id);
+    saveAddedMeta(addedMeta);
+    if(addedUrls[id]){ URL.revokeObjectURL(addedUrls[id]); delete addedUrls[id]; }
+    try{ await dbDelete(id); }catch(e){ /* blob already gone */ }
+  }else{
+    deletedIds.add(id);
+    saveDeleted(deletedIds);
+  }
+  delete overrides[id];
+  saveOverrides(overrides);
+  closeDetail();
+  await render();
+  showToast("Design deleted");
+});
+
+/* ---- Add design ---- */
+const sheetBackdrop = document.getElementById("sheetBackdrop");
+const fileInput = document.getElementById("fileInput");
+const designName = document.getElementById("designName");
+const preview = document.getElementById("preview");
+let pickedFile = null;
+
+document.getElementById("fab").addEventListener("click", ()=>{
+  sheetBackdrop.classList.add("open");
+  document.body.style.overflow = "hidden";
+});
+function closeSheet(){
+  sheetBackdrop.classList.remove("open");
+  document.body.style.overflow = "";
+  fileInput.value = ""; designName.value = ""; preview.innerHTML = ""; preview.style.display = "none";
+  pickedFile = null;
+}
+document.getElementById("cancelAdd").addEventListener("click", closeSheet);
+sheetBackdrop.addEventListener("click", e=>{ if(e.target===sheetBackdrop) closeSheet(); });
+
+fileInput.addEventListener("change", ()=>{
+  pickedFile = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+  preview.innerHTML = "";
+  if(!pickedFile){ preview.style.display = "none"; return; }
+  const url = URL.createObjectURL(pickedFile);
+  preview.innerHTML = pickedFile.type.startsWith("video")
+    ? '<video src="'+url+'" controls playsinline></video>'
+    : '<img src="'+url+'" alt="preview">';
+  preview.style.display = "block";
+  if(!designName.value.trim()){
+    designName.value = pickedFile.name.replace(/\.[^.]+$/,"").replace(/[-_]+/g," ").trim();
+  }
+});
+
+document.getElementById("saveAdd").addEventListener("click", async ()=>{
+  if(!pickedFile){ showToast("Please pick a photo or video first"); return; }
+  const name = designName.value.trim() || "Untitled Design";
+  const id = "u" + Date.now();
+  const type = pickedFile.type.startsWith("video") ? "video" : "image";
+  try{
+    await dbPut(id, pickedFile);
+  }catch(e){
+    showToast("Could not save on this phone — storage full?");
+    return;
+  }
+  addedMeta.push({id:id, name:name, type:type});
+  saveAddedMeta(addedMeta);
+  closeSheet();
+  await render();
+  showToast("Design saved");
+});
+
+/* ---- Toast ---- */
+let toastTimer = null;
+function showToast(msg){
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>{ t.style.display = "none"; }, 2200);
+}
+
+/* ---- Service worker (offline-first) ---- */
+if("serviceWorker" in navigator){
+  window.addEventListener("load", ()=>{
+    navigator.serviceWorker.register("sw.js").catch(()=>{ /* offline still works from cache on next visit */ });
+  });
+}
+
+render();
+</script>
+</body>
+</html>
