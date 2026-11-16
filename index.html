@@ -123,7 +123,7 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
     <p>Designs Collection</p>
     <div class="count" id="count"></div>
     <div class="offline-status" id="offlineStatus">Checking offline status…</div>
-    <div class="sync-status" id="syncStatus">v10 • Sync: Connecting…</div>
+    <div class="sync-status" id="syncStatus">v11 • Sync: Connecting…</div>
   </header>
 
   <div class="search-wrap">
@@ -216,9 +216,16 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
      local changes that never synced are re-queued on load
      (reconcile), and the status line shows pending count + last
      sync error so a failure is never invisible again.
+   - v11: Firebase SDK 10.12.2 → 12.19.0 (fixes the SDK's
+     INTERNAL ASSERTION FAILED queue-kill bug, PR 9842); listeners
+     attach exactly ONCE per load (no re-attach churn — the old
+     re-attach race is what triggered the assertion); an assertion
+     error shows in full (~140 chars) and reloads the page once
+     (guarded 1x/10 min) because only a fresh load revives the
+     dead SDK queue.
    ===================================================================== */
 const FIREBASE_CONFIG = { apiKey:"AIzaSyCbT8irlz7BuQAEFWdbSJL9bYEoYCIh6xI", authDomain:"al-ghuse-tailor.firebaseapp.com", projectId:"al-ghuse-tailor", storageBucket:"al-ghuse-tailor.firebasestorage.app", messagingSenderId:"884157794234", appId:"1:884157794234:web:d9041c781172350f603f83" };
-const FB_SDK = "https://www.gstatic.com/firebasejs/10.12.2/";
+const FB_SDK = "https://www.gstatic.com/firebasejs/12.19.0/";
 
 /* Remote (Firestore) state — merged over local state at render time.
    Firestore wins for renames; deletes are a union (a delete is a
@@ -228,7 +235,8 @@ let fbReady = false;      // true once anonymous sign-in succeeded
 let fbInitStarted = false;
 let fbApp = null;
 let listenersAttached = false;
-let listenerRetryTimer = null;
+let listenerWatchdogTimer = null; // last-resort listener retry (5 min), fires at most once per page load
+let listenerWatchdogDone = false;
 let fbOverrides = {};     // design id -> name
 let fbDeleted = new Set();// design ids deleted on any phone
 let fbAdded = {};         // design id -> {name, type, imageData, posterData, videoLocalOnly}
@@ -442,16 +450,36 @@ async function syncAddDesign(id, name, type, file){
   updateSyncStatus();
 }
 
-/* ---- Firestore listeners (attach after anonymous sign-in) ---- */
-function scheduleListenerRetry(){
-  if(listenerRetryTimer) return;
-  listenerRetryTimer = setTimeout(()=>{ listenerRetryTimer = null; listenersAttached = false; if(fbReady) attachListeners(); }, 30000);
+/* ---- Firestore listeners (attach EXACTLY ONCE per page load) ----
+   The SDK's listeners auto-reconnect internally, so re-attaching
+   them is never needed — and tearing a listener target down while
+   re-adding it is exactly the race that triggers the SDK's
+   INTERNAL ASSERTION FAILED bug (watch-target counter going
+   negative, async queue killed). So: attach once, never detach,
+   never re-attach. A listener error is recorded (and may trigger
+   the reload recovery) but the listeners stay put. */
+function armListenerWatchdog(){
+  /* Last resort only: if NO snapshot has ever arrived after 5
+     minutes (listeners never got going at all), try attaching
+     once more. Never fires if any snapshot arrived, and never
+     more than once per page load. */
+  if(listenerWatchdogTimer || listenerWatchdogDone) return;
+  listenerWatchdogTimer = setTimeout(()=>{
+    listenerWatchdogTimer = null;
+    listenerWatchdogDone = true;
+    const anySnapshot = fbSnapshotsLoaded.overrides || fbSnapshotsLoaded.deleted || fbSnapshotsLoaded.added;
+    if(!anySnapshot && fbReady && listenersAttached){
+      listenersAttached = false;
+      attachListeners();
+    }
+  }, 5 * 60 * 1000);
 }
 function attachListeners(){
   if(listenersAttached || !fbReady) return;
   listenersAttached = true;
+  armListenerWatchdog();
   const F = fb;
-  const onErr = ()=>{ listenersAttached = false; scheduleListenerRetry(); };
+  const onErr = (err)=>{ setSyncError(err); /* listeners stay attached; the SDK reconnects internally */ };
   F.onSnapshot(F.collection(F.db, "overrides"), (snap)=>{
     const m = {};
     snap.forEach(d=>{ const v = d.data(); if(v && typeof v.name === "string") m[d.id] = v.name; });
@@ -546,13 +574,13 @@ function reconcileLocalWithServer(){
 /* ---- App version + live sync status line (header) ----
    Shows which version is actually running on this phone, so a stale
    cached page can never be mistaken for the latest one. */
-const APP_VERSION = "v10";
+const APP_VERSION = "v11";
 const syncStatusEl = document.getElementById("syncStatus");
 let syncBaseState = "Connecting…"; // Connected | Local only | Connecting…
 let lastSyncError = "";            // short message of the last failed write ("" = none)
 function shortErr(e){
   const m = String((e && e.message) || e || "sync failed").replace(/^FirebaseError:\s*/, "").trim();
-  return m.slice(0, 48);
+  return m.slice(0, 140);
 }
 function updateSyncStatus(){
   if(!syncStatusEl) return;
@@ -566,7 +594,26 @@ function setSyncStatus(state){
   if(state === "Connected") lastSyncError = "";
   updateSyncStatus();
 }
-function setSyncError(e){ lastSyncError = shortErr(e); updateSyncStatus(); }
+function setSyncError(e){ lastSyncError = shortErr(e); updateSyncStatus(); maybeRecoverFromAssertion(e); }
+/* ---- Recovery from a dead Firestore queue ----
+   If the SDK reports INTERNAL ASSERTION FAILED its async queue is
+   dead for good on this page load: no write or listener will ever
+   succeed again until the page reloads. (Known SDK bug — the
+   watch-target counter goes negative; fixed in newer SDKs, but a
+   stale response can still hit an old version.) So show the error
+   and reload once after ~3s. Guarded to at most once per 10 min
+   so a recurring failure can never loop the page. Pending ops
+   live in localStorage and flush after the reload. */
+function maybeRecoverFromAssertion(e){
+  const msg = String((e && e.message) || e || "");
+  if(!/INTERNAL ASSERTION FAILED/i.test(msg)) return;
+  try{
+    const last = Number(sessionStorage.getItem("alghuse_assert_reload") || "0");
+    if(Date.now() - last < 10 * 60 * 1000) return; // reloaded recently — don't loop
+    sessionStorage.setItem("alghuse_assert_reload", String(Date.now()));
+  }catch(err){ /* sessionStorage unavailable — still reload once */ }
+  setTimeout(()=>{ location.reload(); }, 3000);
+}
 function clearSyncError(){ if(lastSyncError){ lastSyncError = ""; updateSyncStatus(); } }
 async function initFirebase(){
   if(!FIREBASE_CONFIG || fbInitStarted) return;
@@ -606,7 +653,7 @@ async function tryAuth(){
   try{ await fb.signInAnonymously(fb.auth); }
   catch(e){ setSyncStatus("Local only"); /* offline — retried on 'online' */ }
 }
-window.addEventListener("online", ()=>{ if(!fbReady) setSyncStatus("Connecting…"); initFirebase(); tryAuth(); attachListeners(); flushPending(); });
+window.addEventListener("online", ()=>{ if(!fbReady) setSyncStatus("Connecting…"); initFirebase(); tryAuth(); flushPending(); });
 // =====================================================================
 
 /* Built-in designs (bundled media — all files live in media/) */
@@ -996,7 +1043,7 @@ if("serviceWorker" in navigator){
    "Offline ready" once every file is cached, so it is safe to go
    offline. The page also asks the worker to (re)start the fill on
    every load, so an interrupted fill always resumes. */
-const SW_CACHE = "alghuse-v10"; // keep in sync with sw.js CACHE
+const SW_CACHE = "alghuse-v11"; // keep in sync with sw.js CACHE
 const FULL_FILES = DESIGNS.map(d=>d.file);
 const offlineStatusEl = document.getElementById("offlineStatus");
 let offlineReady = false;

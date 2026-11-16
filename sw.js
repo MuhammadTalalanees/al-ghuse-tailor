@@ -1,6 +1,7 @@
-/* Al-Ghuse Tailor — offline-first service worker (v10).
-   Same behavior as v9 — cache name bumped only so phones pick up
-   the v10 index.html (silent write-path fixes + sync-status line).
+/* Al-Ghuse Tailor — offline-first service worker (v11).
+   Same behavior as v10 — cache name bumped only so phones pick up
+   the v11 index.html (Firebase SDK 12.19.0 + attach-once listeners
+   + assertion reload recovery + full-length sync errors).
    First visit caches only the small critical set (app shell + grid
    thumbnails + video posters, ~2 MB) so the app opens fast even on a
    slow connection. Full-size photos and videos then fill the cache in
@@ -11,7 +12,7 @@
    interrupted fill (tab closed, worker stopped, network drop) always
    picks up where it left off instead of silently never finishing.
    Any file is also cached on demand when first fetched (200 only). */
-const CACHE = 'alghuse-v10';
+const CACHE = 'alghuse-v11';
 const CRITICAL = [
   "index.html",
   "manifest.json",
