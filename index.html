@@ -123,7 +123,7 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
     <p>Designs Collection</p>
     <div class="count" id="count"></div>
     <div class="offline-status" id="offlineStatus">Checking offline status…</div>
-    <div class="sync-status" id="syncStatus">v11 • Sync: Connecting…</div>
+    <div class="sync-status" id="syncStatus">v12 • Sync: Connecting…</div>
   </header>
 
   <div class="search-wrap">
@@ -223,6 +223,16 @@ header p{font-size:13px;color:#c8d2dc;margin-top:2px}
      error shows in full (~140 chars) and reloads the page once
      (guarded 1x/10 min) because only a fresh load revives the
      dead SDK queue.
+   - v12: v11 did NOT cure it — the assertion fired again on 12.19.0
+     (ID: b815, the secondary echo of the primary ca9 queue-kill;
+     the SDK's own docs say there is no application-level fix for
+     the watch-target race). So the full Firestore SDK is GONE:
+     the app now uses the Firestore LITE SDK (no listeners, no
+     offline persistence — plain one-off reads/writes) + polling
+     every 10s instead of onSnapshot. The Lite SDK has no watch
+     targets, so it cannot trigger any of the three known causes
+     of the assertion. Auth stays on the regular SDK. The app's
+     own localStorage/IndexedDB stores are the offline layer.
    ===================================================================== */
 const FIREBASE_CONFIG = { apiKey:"AIzaSyCbT8irlz7BuQAEFWdbSJL9bYEoYCIh6xI", authDomain:"al-ghuse-tailor.firebaseapp.com", projectId:"al-ghuse-tailor", storageBucket:"al-ghuse-tailor.firebasestorage.app", messagingSenderId:"884157794234", appId:"1:884157794234:web:d9041c781172350f603f83" };
 const FB_SDK = "https://www.gstatic.com/firebasejs/12.19.0/";
@@ -230,19 +240,18 @@ const FB_SDK = "https://www.gstatic.com/firebasejs/12.19.0/";
 /* Remote (Firestore) state — merged over local state at render time.
    Firestore wins for renames; deletes are a union (a delete is a
    delete — there is no un-delete in the app). */
-let fb = null;            // {app, auth, db, doc, collection, setDoc, deleteDoc, onSnapshot, serverTimestamp, signInAnonymously}
+let fb = null;            // {app, auth, db, doc, collection, setDoc, deleteDoc, getDocs, serverTimestamp, signInAnonymously} — Firestore LITE SDK (no listeners, no watch targets)
 let fbReady = false;      // true once anonymous sign-in succeeded
 let fbInitStarted = false;
 let fbApp = null;
-let listenersAttached = false;
-let listenerWatchdogTimer = null; // last-resort listener retry (5 min), fires at most once per page load
-let listenerWatchdogDone = false;
+let pollTimer = null;     // 10s poll interval handle
+let pollInFlight = false; // a poll is running — never overlap two polls
 let fbOverrides = {};     // design id -> name
 let fbDeleted = new Set();// design ids deleted on any phone
 let fbAdded = {};         // design id -> {name, type, imageData, posterData, videoLocalOnly}
 let syncedAdded = loadSyncedAdded(); // local added ids whose doc reached Firestore
 let flushing = false;
-let fbSnapshotsLoaded = {overrides:false, deleted:false, added:false}; // set by each onSnapshot's first fire
+let fbSnapshotsLoaded = {overrides:false, deleted:false, added:false}; // set by each poll's first success
 
 const LS_PENDING = "alghuse_pending_ops";   // [{kind,id,name?,type?}] — Firestore writes waiting for a connection
 const LS_SYNCED_ADDED = "alghuse_synced_added"; // [id] — added designs already stored in Firestore
@@ -450,59 +459,45 @@ async function syncAddDesign(id, name, type, file){
   updateSyncStatus();
 }
 
-/* ---- Firestore listeners (attach EXACTLY ONCE per page load) ----
-   The SDK's listeners auto-reconnect internally, so re-attaching
-   them is never needed — and tearing a listener target down while
-   re-adding it is exactly the race that triggers the SDK's
-   INTERNAL ASSERTION FAILED bug (watch-target counter going
-   negative, async queue killed). So: attach once, never detach,
-   never re-attach. A listener error is recorded (and may trigger
-   the reload recovery) but the listeners stay put. */
-function armListenerWatchdog(){
-  /* Last resort only: if NO snapshot has ever arrived after 5
-     minutes (listeners never got going at all), try attaching
-     once more. Never fires if any snapshot arrived, and never
-     more than once per page load. */
-  if(listenerWatchdogTimer || listenerWatchdogDone) return;
-  listenerWatchdogTimer = setTimeout(()=>{
-    listenerWatchdogTimer = null;
-    listenerWatchdogDone = true;
-    const anySnapshot = fbSnapshotsLoaded.overrides || fbSnapshotsLoaded.deleted || fbSnapshotsLoaded.added;
-    if(!anySnapshot && fbReady && listenersAttached){
-      listenersAttached = false;
-      attachListeners();
-    }
-  }, 5 * 60 * 1000);
+/* ---- Firestore polling (NO listeners — Firestore Lite SDK) ----
+   The full Firestore SDK is gone on purpose: its watch-target
+   machinery kept killing its own async queue with INTERNAL
+   ASSERTION FAILED (ca9, then its echo b815), even on SDK 12.19.0
+   with the PR 9842 fix and attach-once listeners. The Lite SDK
+   has no listeners and no offline persistence — every call is a
+   plain one-off read/write, so there are no watch targets to
+   corrupt and the assertion cannot fire. Remote changes arrive
+   via pollFirestore() every 10s (visible tab only) instead of
+   onSnapshot. The merge logic is identical to the old listeners. */
+function startPolling(){
+  if(pollTimer) return;
+  pollTimer = setInterval(()=>{ pollFirestore(); }, 10000);
 }
-function attachListeners(){
-  if(listenersAttached || !fbReady) return;
-  listenersAttached = true;
-  armListenerWatchdog();
-  const F = fb;
-  const onErr = (err)=>{ setSyncError(err); /* listeners stay attached; the SDK reconnects internally */ };
-  F.onSnapshot(F.collection(F.db, "overrides"), (snap)=>{
+async function pollFirestore(){
+  if(!fbReady || !fb || pollInFlight) return;
+  if(document.hidden) return; // only poll while the tab is visible
+  pollInFlight = true;
+  try{
+    const F = fb;
+    const [ovSnap, delSnap, addSnap] = await Promise.all([
+      F.getDocs(F.collection(F.db, "overrides")),
+      F.getDocs(F.collection(F.db, "deleted")),
+      F.getDocs(F.collection(F.db, "added"))
+    ]);
     const m = {};
-    snap.forEach(d=>{ const v = d.data(); if(v && typeof v.name === "string") m[d.id] = v.name; });
+    ovSnap.forEach(d=>{ const v = d.data(); if(v && typeof v.name === "string") m[d.id] = v.name; });
     fbOverrides = m;
     fbSnapshotsLoaded.overrides = true;
-    reconcileLocalWithServer();
-    render();
-  }, onErr);
-  F.onSnapshot(F.collection(F.db, "deleted"), (snap)=>{
     const known = new Set(DESIGNS.map(d=>d.id));
     const s = new Set();
-    snap.forEach(d=>{ if(known.has(d.id)) s.add(d.id); });
+    delSnap.forEach(d=>{ if(known.has(d.id)) s.add(d.id); });
     fbDeleted = s;
     fbSnapshotsLoaded.deleted = true;
-    reconcileLocalWithServer();
-    render();
-  }, onErr);
-  F.onSnapshot(F.collection(F.db, "added"), (snap)=>{
-    const m = {};
-    snap.forEach(d=>{
+    const am = {};
+    addSnap.forEach(d=>{
       const v = d.data();
       if(!v) return;
-      m[d.id] = {
+      am[d.id] = {
         name: (typeof v.name === "string" ? v.name : "Untitled Design"),
         type: (v.type === "video" ? "video" : "image"),
         imageData: (typeof v.imageData === "string" ? v.imageData : null),
@@ -510,27 +505,30 @@ function attachListeners(){
         videoLocalOnly: !!v.videoLocalOnly
       };
     });
-    fbAdded = m;
+    fbAdded = am;
     fbSnapshotsLoaded.added = true;
-    reconcileLocalWithServer();
-    if(!snap.metadata.fromCache){
-      /* Server state: a synced added design missing here was deleted
-         on another phone — remove its local copy too. (Only from a
-         server snapshot: a cache-only snapshot may legitimately lag.) */
-      let changed = false;
-      for(const id of [...syncedAdded]){
-        if(!fbAdded[id]){
-          syncedAdded.delete(id); changed = true;
-          addedMeta = addedMeta.filter(a=>a.id!==id);
-          if(addedUrls[id]){ URL.revokeObjectURL(addedUrls[id]); delete addedUrls[id]; }
-          dbDelete(id).catch(()=>{});
-        }
+    /* Server state (a poll is always from the server, never a
+       cache): a synced added design missing here was deleted on
+       another phone — remove its local copy too. */
+    let changed = false;
+    for(const id of [...syncedAdded]){
+      if(!fbAdded[id]){
+        syncedAdded.delete(id); changed = true;
+        addedMeta = addedMeta.filter(a=>a.id!==id);
+        if(addedUrls[id]){ URL.revokeObjectURL(addedUrls[id]); delete addedUrls[id]; }
+        dbDelete(id).catch(()=>{});
       }
-      if(changed){ saveSyncedAdded(); saveAddedMeta(addedMeta); }
     }
+    if(changed){ saveSyncedAdded(); saveAddedMeta(addedMeta); }
+    reconcileLocalWithServer();
     render();
-  }, onErr);
+  }catch(e){
+    setSyncError(e); // poll failed (offline etc.) — local state keeps working; next poll retries
+  }finally{
+    pollInFlight = false;
+  }
 }
+document.addEventListener("visibilitychange", ()=>{ if(!document.hidden && fbReady) pollFirestore(); });
 
 /* ---- Self-heal: reconcile local state with Firestore ----
    Runs after each snapshot arrives. Anything saved on this phone
@@ -574,7 +572,7 @@ function reconcileLocalWithServer(){
 /* ---- App version + live sync status line (header) ----
    Shows which version is actually running on this phone, so a stale
    cached page can never be mistaken for the latest one. */
-const APP_VERSION = "v11";
+const APP_VERSION = "v12";
 const syncStatusEl = document.getElementById("syncStatus");
 let syncBaseState = "Connecting…"; // Connected | Local only | Connecting…
 let lastSyncError = "";            // short message of the last failed write ("" = none)
@@ -596,11 +594,11 @@ function setSyncStatus(state){
 }
 function setSyncError(e){ lastSyncError = shortErr(e); updateSyncStatus(); maybeRecoverFromAssertion(e); }
 /* ---- Recovery from a dead Firestore queue ----
-   If the SDK reports INTERNAL ASSERTION FAILED its async queue is
-   dead for good on this page load: no write or listener will ever
-   succeed again until the page reloads. (Known SDK bug — the
-   watch-target counter goes negative; fixed in newer SDKs, but a
-   stale response can still hit an old version.) So show the error
+   Belt and braces only: with the Lite SDK there is no watch-target
+   machinery and no persistent cache, so INTERNAL ASSERTION FAILED
+   should never fire at all. But if the SDK ever reports it, its
+   async queue is dead for good on this page load: no write will
+   ever succeed again until the page reloads. So show the error
    and reload once after ~3s. Guarded to at most once per 10 min
    so a recurring failure can never loop the page. Pending ops
    live in localStorage and flush after the reload. */
@@ -622,25 +620,28 @@ async function initFirebase(){
     const [appMod, authMod, fsMod] = await Promise.all([
       import(FB_SDK + "firebase-app.js"),
       import(FB_SDK + "firebase-auth.js"),
-      import(FB_SDK + "firebase-firestore.js")
+      import(FB_SDK + "firebase-firestore-lite.js")
     ]);
     if(!fbApp){
       try{ fbApp = appMod.initializeApp(FIREBASE_CONFIG); }
       catch(e){ fbApp = appMod.getApp(); } // already initialized (retry after a partial failure)
     }
     const auth = authMod.getAuth(fbApp);
+    /* Lite SDK: no persistentLocalCache option exists (and no
+       listeners) — initializeFirestore(app) only. The app's own
+       localStorage/IndexedDB stores are the offline layer. */
     let db;
     try{
-      db = fsMod.initializeFirestore(fbApp, {localCache: fsMod.persistentLocalCache({})});
+      db = fsMod.initializeFirestore(fbApp);
     }catch(e){
-      db = fsMod.getFirestore(fbApp); // persistent cache unavailable — in-memory cache instead
+      db = fsMod.getFirestore(fbApp); // already initialized (retry after a partial failure)
     }
     fb = {app: fbApp, auth, db,
       doc: fsMod.doc, collection: fsMod.collection, setDoc: fsMod.setDoc, deleteDoc: fsMod.deleteDoc,
-      onSnapshot: fsMod.onSnapshot, serverTimestamp: fsMod.serverTimestamp,
+      getDocs: fsMod.getDocs, serverTimestamp: fsMod.serverTimestamp,
       signInAnonymously: authMod.signInAnonymously};
     authMod.onAuthStateChanged(auth, (user)=>{
-      if(user){ fbReady = true; setSyncStatus("Connected"); attachListeners(); flushPending(); }
+      if(user){ fbReady = true; setSyncStatus("Connected"); startPolling(); pollFirestore(); flushPending(); }
       else{ tryAuth(); }
     });
   }catch(e){
@@ -653,7 +654,7 @@ async function tryAuth(){
   try{ await fb.signInAnonymously(fb.auth); }
   catch(e){ setSyncStatus("Local only"); /* offline — retried on 'online' */ }
 }
-window.addEventListener("online", ()=>{ if(!fbReady) setSyncStatus("Connecting…"); initFirebase(); tryAuth(); flushPending(); });
+window.addEventListener("online", ()=>{ if(!fbReady) setSyncStatus("Connecting…"); initFirebase(); tryAuth(); pollFirestore(); flushPending(); });
 // =====================================================================
 
 /* Built-in designs (bundled media — all files live in media/) */
@@ -1043,7 +1044,7 @@ if("serviceWorker" in navigator){
    "Offline ready" once every file is cached, so it is safe to go
    offline. The page also asks the worker to (re)start the fill on
    every load, so an interrupted fill always resumes. */
-const SW_CACHE = "alghuse-v11"; // keep in sync with sw.js CACHE
+const SW_CACHE = "alghuse-v12"; // keep in sync with sw.js CACHE
 const FULL_FILES = DESIGNS.map(d=>d.file);
 const offlineStatusEl = document.getElementById("offlineStatus");
 let offlineReady = false;
