@@ -1,8 +1,8 @@
-/* Al-Ghuse Tailor — offline-first service worker (v12).
-   Same behavior as v11 — cache name bumped only so phones pick up
-   the v12 index.html (Firestore Lite SDK + 10s polling instead of
-   onSnapshot listeners + assertion reload recovery + full-length
-   sync errors).
+/* Al-Ghuse Tailor — offline-first service worker (v13).
+   Same behavior as v12 — cache name bumped only so phones pick up
+   the v13 index.html (remote adds/renames/deletes now persist locally
+   so they survive an offline reload + offline shown as Offline, not
+   Error).
    First visit caches only the small critical set (app shell + grid
    thumbnails + video posters, ~2 MB) so the app opens fast even on a
    slow connection. Full-size photos and videos then fill the cache in
@@ -13,7 +13,7 @@
    interrupted fill (tab closed, worker stopped, network drop) always
    picks up where it left off instead of silently never finishing.
    Any file is also cached on demand when first fetched (200 only). */
-const CACHE = 'alghuse-v12';
+const CACHE = 'alghuse-v13';
 const CRITICAL = [
   "index.html",
   "manifest.json",

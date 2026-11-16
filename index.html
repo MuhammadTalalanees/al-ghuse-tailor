@@ -410,7 +410,7 @@ async function applyOp(op){
 }
 async function fbWriteOrQueue(op){
   try{
-    if(fbReady){ await applyOp(op); clearSyncError(); return; }
+    if(fbReady){ await applyOp(op); setSyncStatus("Connected"); return; } // also recovers from the Offline state
   }catch(e){ setSyncError(e); /* fall through to queue */ }
   queueOp(op);
 }
@@ -431,7 +431,7 @@ async function flushPending(){
         setSyncError(e); // op stays in the queue — retried by the periodic flush
       }
     }
-    if(!failed && !loadPending().length) clearSyncError();
+    if(!failed && !loadPending().length) setSyncStatus("Connected"); // also recovers from the Offline state
     updateSyncStatus();
   }finally{ flushing = false; }
 }
@@ -473,6 +473,67 @@ function startPolling(){
   if(pollTimer) return;
   pollTimer = setInterval(()=>{ pollFirestore(); }, 10000);
 }
+/* Persist what the server says, so the receiving phone keeps it
+   offline too. v12 kept remote adds/renames/deletes in memory only
+   (fbAdded/fbOverrides/fbDeleted) — the Lite SDK has no offline
+   cache to fall back on, so an offline reload on the receiving
+   phone lost them all (Talal's 7 synced adds vanished offline).
+   Now every successful poll saves them into the same local stores
+   the phone's own changes use. */
+function mergeServerRenames(m){
+  /* Firestore wins for renames. Guard: a rename this phone made
+     that has not reached the server yet (queued op) is never
+     overwritten — reconcile pushes it, and the next poll brings
+     the server value back. */
+  const queued = loadPending();
+  let changed = false;
+  for(const id of Object.keys(m)){
+    if(queued.some(o=>o.kind==="rename" && o.id===id)) continue;
+    if(overrides[id] !== m[id]){ overrides[id] = m[id]; changed = true; }
+  }
+  if(changed) saveOverrides(overrides);
+}
+function mergeServerDeletes(s){
+  /* Deletes are a union and permanent — safe to merge blindly. */
+  let changed = false;
+  for(const id of s){
+    if(!deletedIds.has(id)){ deletedIds.add(id); changed = true; }
+  }
+  if(changed) saveDeleted(deletedIds);
+}
+async function dataUrlToBlob(u){
+  const r = await fetch(u);
+  return await r.blob();
+}
+async function persistRemoteAdds(am){
+  /* A design added on another phone must survive an offline reload
+     on THIS phone: save its media into IndexedDB and record it in
+     addedMeta (marked remote) + syncedAdded, exactly like a local
+     add. Photos save as the downscaled image; videos save their
+     poster only (the video file itself stays phone-only, as before).
+     Skips anything already held locally; a failed save is retried
+     on the next poll. */
+  let changedMeta = false, changedSynced = false;
+  for(const id of Object.keys(am)){
+    const r = am[id];
+    if(!r) continue;
+    if(addedMeta.some(a=>a.id===id)) continue; // own add, or already persisted
+    try{
+      if(r.type==="image"){
+        if(!r.imageData) continue; // photo still uploading on the other phone
+        await dbPut(id, await dataUrlToBlob(r.imageData));
+        addedMeta.push({id, name:r.name, type:"image", remote:true});
+      }else if(r.type==="video"){
+        if(!r.posterData) continue; // poster not ready yet
+        await dbPut(id+":poster", await dataUrlToBlob(r.posterData));
+        addedMeta.push({id, name:r.name, type:"video", remote:true});
+      }else continue;
+      syncedAdded.add(id); changedMeta = true; changedSynced = true;
+    }catch(e){ /* save failed — retry on the next poll */ }
+  }
+  if(changedMeta) saveAddedMeta(addedMeta);
+  if(changedSynced) saveSyncedAdded();
+}
 async function pollFirestore(){
   if(!fbReady || !fb || pollInFlight) return;
   if(document.hidden) return; // only poll while the tab is visible
@@ -484,15 +545,15 @@ async function pollFirestore(){
       F.getDocs(F.collection(F.db, "deleted")),
       F.getDocs(F.collection(F.db, "added"))
     ]);
+    /* Build ALL new state in locals first — the live fb* state is
+       only swapped in once every collection has been fetched, so a
+       failed poll can never leave the three collections inconsistent
+       or touch the last good state. */
     const m = {};
     ovSnap.forEach(d=>{ const v = d.data(); if(v && typeof v.name === "string") m[d.id] = v.name; });
-    fbOverrides = m;
-    fbSnapshotsLoaded.overrides = true;
     const known = new Set(DESIGNS.map(d=>d.id));
     const s = new Set();
     delSnap.forEach(d=>{ if(known.has(d.id)) s.add(d.id); });
-    fbDeleted = s;
-    fbSnapshotsLoaded.deleted = true;
     const am = {};
     addSnap.forEach(d=>{
       const v = d.data();
@@ -505,11 +566,19 @@ async function pollFirestore(){
         videoLocalOnly: !!v.videoLocalOnly
       };
     });
+    fbOverrides = m;
+    fbSnapshotsLoaded.overrides = true;
+    fbDeleted = s;
+    fbSnapshotsLoaded.deleted = true;
     fbAdded = am;
     fbSnapshotsLoaded.added = true;
+    mergeServerRenames(m);
+    mergeServerDeletes(s);
+    await persistRemoteAdds(am);
     /* Server state (a poll is always from the server, never a
        cache): a synced added design missing here was deleted on
-       another phone — remove its local copy too. */
+       another phone — remove its local copy too. Runs only on a
+       successful poll, never after a failed one. */
     let changed = false;
     for(const id of [...syncedAdded]){
       if(!fbAdded[id]){
@@ -517,13 +586,15 @@ async function pollFirestore(){
         addedMeta = addedMeta.filter(a=>a.id!==id);
         if(addedUrls[id]){ URL.revokeObjectURL(addedUrls[id]); delete addedUrls[id]; }
         dbDelete(id).catch(()=>{});
+        dbDelete(id+":poster").catch(()=>{}); // remote video poster, if any
       }
     }
     if(changed){ saveSyncedAdded(); saveAddedMeta(addedMeta); }
+    setSyncStatus("Connected"); // a successful poll means we are online (recovers the Offline state)
     reconcileLocalWithServer();
     render();
   }catch(e){
-    setSyncError(e); // poll failed (offline etc.) — local state keeps working; next poll retries
+    setSyncError(e); // network failures become the Offline state inside setSyncError; next poll retries
   }finally{
     pollInFlight = false;
   }
@@ -572,7 +643,7 @@ function reconcileLocalWithServer(){
 /* ---- App version + live sync status line (header) ----
    Shows which version is actually running on this phone, so a stale
    cached page can never be mistaken for the latest one. */
-const APP_VERSION = "v12";
+const APP_VERSION = "v13";
 const syncStatusEl = document.getElementById("syncStatus");
 let syncBaseState = "Connecting…"; // Connected | Local only | Connecting…
 let lastSyncError = "";            // short message of the last failed write ("" = none)
@@ -592,7 +663,24 @@ function setSyncStatus(state){
   if(state === "Connected") lastSyncError = "";
   updateSyncStatus();
 }
-function setSyncError(e){ lastSyncError = shortErr(e); updateSyncStatus(); maybeRecoverFromAssertion(e); }
+/* A network failure is NOT a sync failure: when the phone is offline
+   (or the connection drops mid-request) the app simply cannot reach
+   Firestore. Showing "Error — Failed to fetch" for that scared Talal
+   (v12): offline is a normal state, the ops stay queued, and the next
+   poll/flush retries them. Only real errors (permission, bad data…)
+   show as "Error — …". */
+function isNetworkError(e){
+  if(!e) return false;
+  const code = (e && e.code) || "";
+  if(code === "unavailable") return true; // Firestore "client is offline"
+  const m = String((e && e.message) || e || "");
+  return /failed to fetch|networkerror|network request failed|load failed|network error|the internet connection appears to be offline|failed to load|timed out|timeout|aborted|econnrefused|enotfound/i.test(m);
+}
+function setOffline(){ syncBaseState = "Offline — will sync when back online"; lastSyncError = ""; updateSyncStatus(); }
+function setSyncError(e){
+  if(isNetworkError(e)){ setOffline(); return; } // never triggers the assertion reload below
+  lastSyncError = shortErr(e); updateSyncStatus(); maybeRecoverFromAssertion(e);
+}
 /* ---- Recovery from a dead Firestore queue ----
    Belt and braces only: with the Lite SDK there is no watch-target
    machinery and no persistent cache, so INTERNAL ASSERTION FAILED
@@ -791,12 +879,19 @@ async function allDesigns(){
   for(const a of addedMeta){
     if(!addedUrls[a.id]){
       let blob = null, dbOk = true;
-      try{ blob = await dbGet(a.id); }catch(e){ dbOk = false; }
+      /* Remote videos store their poster under id+":poster" (the
+         video file itself never leaves its home phone). */
+      const key = (a.remote && a.type==="video") ? a.id+":poster" : a.id;
+      try{ blob = await dbGet(key); }catch(e){ dbOk = false; }
       if(blob) addedUrls[a.id] = URL.createObjectURL(blob);
       else if(dbOk) stale.push(a.id); // metadata saved but media gone — drop the stale entry
       // if IndexedDB itself failed, keep the metadata and just skip it this render
     }
-    if(addedUrls[a.id]){ listed.add(a.id); list.push({id:a.id, name:displayName(a), file:addedUrls[a.id], type:a.type, added:true}); }
+    if(addedUrls[a.id]){
+      listed.add(a.id);
+      if(a.remote && a.type==="video") list.push({id:a.id, name:displayName(a), file:null, poster:addedUrls[a.id], type:"video", added:true, remote:true, videoRemote:true});
+      else list.push({id:a.id, name:displayName(a), file:addedUrls[a.id], type:a.type, added:true, remote:!!a.remote});
+    }
   }
   if(stale.length){
     /* A stale local entry whose synced copy still exists in Firestore
@@ -955,6 +1050,7 @@ document.getElementById("confirmDelete").addEventListener("click", async ()=>{
     saveAddedMeta(addedMeta);
     if(addedUrls[id]){ URL.revokeObjectURL(addedUrls[id]); delete addedUrls[id]; }
     try{ await dbDelete(id); }catch(e){ /* blob already gone */ }
+    try{ await dbDelete(id+":poster"); }catch(e){ /* no poster stored */ }
     syncDeleteAdded(id);
   }else{
     deletedIds.add(id);
@@ -1044,7 +1140,7 @@ if("serviceWorker" in navigator){
    "Offline ready" once every file is cached, so it is safe to go
    offline. The page also asks the worker to (re)start the fill on
    every load, so an interrupted fill always resumes. */
-const SW_CACHE = "alghuse-v12"; // keep in sync with sw.js CACHE
+const SW_CACHE = "alghuse-v13"; // keep in sync with sw.js CACHE
 const FULL_FILES = DESIGNS.map(d=>d.file);
 const offlineStatusEl = document.getElementById("offlineStatus");
 let offlineReady = false;
